@@ -12,6 +12,13 @@ import { HostServer, DisplayInfo, generatePairingCode } from './signaling';
 
 const RENDERER = path.join(__dirname, '..', 'renderer');
 
+// Per-screen capture uses getDisplayMedia (for OS-cursor suppression), and
+// the host starts streaming in response to a client connecting over the
+// network — there is no user gesture in the host window at that moment.
+// Without this flag Chromium rejects gesture-less getDisplayMedia calls
+// before the displayMediaRequestHandler ever runs, breaking streaming.
+app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
+
 interface Settings {
   hostName: string;
   port: number;

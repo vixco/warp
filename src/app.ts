@@ -297,7 +297,17 @@ class HostEngine {
     // does not. The main process picks the source for this display via the
     // displayMediaRequestHandler — we queue the displayId first, and
     // serialize captures so that single-slot matching is race-free.
-    const stream = await captureDisplay(displayId);
+    let stream: MediaStream;
+    try {
+      stream = await captureDisplay(displayId);
+    } catch (err: any) {
+      console.error('display capture failed', err);
+      warp.toSession(sessionId, {
+        type: 'error',
+        error: `screen capture unavailable: ${err?.message || err}`,
+      });
+      return;
+    }
 
     // System audio: captured from a virtual audio device (BlackHole & co) via
     // plain getUserMedia. Note: SCK loopback (getDisplayMedia audio) stalls

@@ -26,6 +26,7 @@ const statusSpinner = document.getElementById('statusSpinner')!;
 const statusRetry = document.getElementById('statusRetry') as HTMLButtonElement;
 const ovLabel = document.getElementById('ovLabel')!;
 const ovStats = document.getElementById('ovStats')!;
+const localCursor = document.getElementById('localCursor')!;
 
 ovLabel.textContent = P.label;
 document.title = `Warp — ${P.label}`;
@@ -289,6 +290,13 @@ let menuOpen = false;
 
 let lastMove = 0;
 window.addEventListener('pointermove', (e) => {
+  // Local cursor tracks the pointer with zero lag (Parsec-style); the host
+  // cursor is suppressed in the stream so this is the only cursor the user
+  // sees. Not throttled — visual responsiveness must never wait on the
+  // network send cap below.
+  if (!menuOpen) {
+    localCursor.style.transform = `translate(${e.clientX}px, ${e.clientY}px)`;
+  }
   if (menuOpen) return;
   const now = performance.now();
   if (now - lastMove < 4) return; // ~250 Hz cap
@@ -301,6 +309,9 @@ window.addEventListener('pointerdown', (e) => {
   if (menuOpen) return;
   if ((e.target as HTMLElement).closest('.overlay, .hotzone')) return;
   e.preventDefault();
+  // Snap the local cursor to the exact click point, then sync the host
+  // position before the button event so the click lands where the user sees.
+  localCursor.style.transform = `translate(${e.clientX}px, ${e.clientY}px)`;
   const pos = normalizedPos(e.clientX, e.clientY);
   if (pos) sendInput({ t: 'mm', d: P.displayId, x: pos.x, y: pos.y });
   sendInput({ t: 'md', b: e.button === 1 ? 1 : e.button === 2 ? 2 : 0 });
@@ -403,6 +414,7 @@ function toggleMenu(open = !menuOpen) {
   menuOpen = open;
   menuEl.classList.toggle('hidden', !menuOpen);
   document.body.classList.toggle('show-cursor', menuOpen);
+  localCursor.classList.toggle('hidden', menuOpen);
   if (menuOpen) {
     sendInput({ t: 'reset' }); // release held keys/buttons
     populateAudioDevices();
@@ -479,11 +491,14 @@ setInterval(async () => {
   } catch { /* ignore */ }
 }, 1000);
 
-// Show the local cursor only near the top hotzone (the remote cursor is in
-// the video); hide it elsewhere.
+// Show the OS cursor only near the top hotzone and while the menu is open
+// (so overlay/menu controls are usable); elsewhere the local zero-lag cursor
+// takes over and the OS cursor stays hidden.
 window.addEventListener('pointermove', (e) => {
-  if (menuOpen) return; // cursor stays visible while the menu is open
-  document.body.classList.toggle('show-cursor', e.clientY < 60);
+  if (menuOpen) return; // OS cursor stays visible while the menu is open
+  const showOs = e.clientY < 60;
+  document.body.classList.toggle('show-cursor', showOs);
+  localCursor.classList.toggle('hidden', showOs);
 });
 
 connect();
