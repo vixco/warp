@@ -1,6 +1,6 @@
 import {
   app, BrowserWindow, ipcMain, screen, desktopCapturer,
-  systemPreferences, shell, clipboard,
+  systemPreferences, shell, clipboard, Tray, Menu, nativeImage,
 } from 'electron';
 import * as path from 'path';
 import * as fs from 'fs';
@@ -20,6 +20,7 @@ interface Settings {
   codec: 'h264' | 'vp9' | 'av1';
   hidpiVirtual: boolean;
   hostingEnabled: boolean;
+  launchAtLogin: boolean;
 }
 
 const settingsFile = () => path.join(app.getPath('userData'), 'settings.json');
@@ -34,6 +35,7 @@ function loadSettings(): Settings {
     codec: 'h264',
     hidpiVirtual: false,
     hostingEnabled: false,
+    launchAtLogin: true,
   };
   try {
     return { ...defaults, ...JSON.parse(fs.readFileSync(settingsFile(), 'utf8')) };
@@ -50,6 +52,8 @@ function saveSettings() {
 const helpers = new NativeHelpers();
 const discovery = new Discovery();
 let mainWindow: BrowserWindow | null = null;
+let tray: Tray | null = null;
+let isQuitting = false;
 const viewerWindows = new Map<string, BrowserWindow>(); // sessionId -> window
 let hostServer: HostServer | null = null;
 let sessionCode = '';
@@ -192,6 +196,7 @@ function pushHostState() {
     mainWindow.webContents.send('host-state', hostState());
   }
   hostServer?.broadcastDisplays();
+  refreshTrayMenu();
 }
 
 function permissionStatus() {
@@ -203,15 +208,78 @@ function permissionStatus() {
 }
 
 // ---------------------------------------------------------------------------
+// Login item + tray
+
+function applyLoginItemSettings() {
+  if (!app.isPackaged) return; // dev runs would register the Electron binary
+  app.setLoginItemSettings({
+    openAtLogin: settings.launchAtLogin,
+    openAsHidden: true,          // macOS: start without showing the window
+    args: ['--hidden'],          // Windows: same, via our own flag
+  });
+}
+
+function showMainWindow() {
+  if (!mainWindow || mainWindow.isDestroyed()) createMainWindow();
+  else { mainWindow.show(); mainWindow.focus(); }
+}
+
+function trayIcon(): Electron.NativeImage {
+  const name = process.platform === 'darwin' ? 'trayTemplate.png' : 'tray.png';
+  const img = nativeImage.createFromPath(path.join(app.getAppPath(), 'assets', name));
+  if (process.platform === 'darwin') img.setTemplateImage(true);
+  return img;
+}
+
+function refreshTrayMenu() {
+  if (!tray) return;
+  const hosting = !!hostServer?.running;
+  tray.setToolTip(hosting ? `Warp — hosting on (${sessionCode})` : 'Warp');
+  tray.setContextMenu(Menu.buildFromTemplate([
+    { label: 'Open Warp', click: () => showMainWindow() },
+    { type: 'separator' },
+    ...(process.platform === 'darwin' ? [{
+      label: hosting ? `Hosting on — code ${sessionCode}` : 'Hosting off',
+      type: 'checkbox' as const,
+      checked: hosting,
+      click: () => { hosting ? stopHosting() : startHosting(); },
+    }] : []),
+    {
+      label: 'Start at login',
+      type: 'checkbox',
+      checked: settings.launchAtLogin,
+      click: () => {
+        settings.launchAtLogin = !settings.launchAtLogin;
+        saveSettings();
+        applyLoginItemSettings();
+        refreshTrayMenu();
+      },
+    },
+    { type: 'separator' },
+    { label: 'Quit Warp', click: () => { isQuitting = true; app.quit(); } },
+  ]));
+}
+
+function createTray() {
+  if (tray) return;
+  tray = new Tray(trayIcon());
+  refreshTrayMenu();
+  tray.on('click', () => {
+    if (process.platform !== 'darwin') showMainWindow();
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Windows
 
-function createMainWindow() {
+function createMainWindow(show = true) {
   mainWindow = new BrowserWindow({
     width: 1120,
     height: 720,
     minWidth: 880,
     minHeight: 560,
     title: 'Warp',
+    show,
     backgroundColor: '#10141c',
     titleBarStyle: process.platform === 'darwin' ? 'hiddenInset' : 'default',
     webPreferences: {
@@ -222,6 +290,14 @@ function createMainWindow() {
     },
   });
   mainWindow.loadFile(path.join(RENDERER, 'index.html'));
+  // Closing the window keeps Warp alive in the tray (Parsec-style); quit via
+  // the tray menu.
+  mainWindow.on('close', (e) => {
+    if (!isQuitting) {
+      e.preventDefault();
+      mainWindow?.hide();
+    }
+  });
   mainWindow.on('closed', () => { mainWindow = null; });
 }
 
@@ -273,6 +349,8 @@ function wireIpc() {
   ipcMain.handle('set-settings', (_e, patch: Partial<Settings>) => {
     settings = { ...settings, ...patch };
     saveSettings();
+    applyLoginItemSettings();
+    refreshTrayMenu();
     return settings;
   });
 
@@ -405,9 +483,16 @@ app.whenReady().then(async () => {
   wireIpc();
   discovery.start();
   discovery.onHostsChanged = (hosts: DiscoveredHost[]) => {
-    mainWindow?.webContents.send('discovered-hosts', hosts);
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('discovered-hosts', hosts);
+    }
   };
-  createMainWindow();
+
+  const startHidden = process.argv.includes('--hidden') ||
+    app.getLoginItemSettings().wasOpenedAsHidden;
+  createMainWindow(!startHidden);
+  createTray();
+  applyLoginItemSettings();
 
   screen.on('display-added', () => pushHostState());
   screen.on('display-removed', () => pushHostState());
@@ -446,17 +531,15 @@ app.whenReady().then(async () => {
     }, 4000);
   }
 
-  app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) createMainWindow();
-  });
+  app.on('activate', () => showMainWindow());
 });
 
 app.on('window-all-closed', () => {
-  // Keep hosting alive in the background on macOS (Parsec-style tray host).
-  if (process.platform !== 'darwin' || !hostServer?.running) app.quit();
+  // Warp lives in the tray; quitting happens via the tray menu.
 });
 
 app.on('before-quit', () => {
+  isQuitting = true;
   stopHosting(false); // keep the hosting preference for next launch
   discovery.stop();
 });

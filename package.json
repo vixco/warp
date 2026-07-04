@@ -37,6 +37,7 @@
       "dist/**/*",
       "!dist/win-unpacked",
       "!dist/mac*",
+      "assets/**/*",
       "package.json"
     ],
     "mac": {

@@ -42,6 +42,7 @@ async function loadSettingsUi() {
   ($('#setPort') as HTMLInputElement).value = String(settings.port);
   ($('#setPairingCode') as HTMLInputElement).value = settings.pairingCode;
   ($('#setHidpi') as HTMLInputElement).checked = !!settings.hidpiVirtual;
+  ($('#setLaunchAtLogin') as HTMLInputElement).checked = !!settings.launchAtLogin;
 }
 
 $('#saveSettingsBtn').addEventListener('click', async () => {
@@ -53,6 +54,7 @@ $('#saveSettingsBtn').addEventListener('click', async () => {
     port: Number(($('#setPort') as HTMLInputElement).value) || 9750,
     pairingCode: ($('#setPairingCode') as HTMLInputElement).value.replace(/\D/g, ''),
     hidpiVirtual: ($('#setHidpi') as HTMLInputElement).checked,
+    launchAtLogin: ($('#setLaunchAtLogin') as HTMLInputElement).checked,
   });
   toast('Settings saved');
 });
