@@ -1,8 +1,12 @@
 name: Release
 
 # Every push to the main development branch builds installers for macOS and
-# Windows and publishes them as a GitHub release. Running Warp apps check the
-# releases feed every 15 minutes and auto-update.
+# Windows and attaches them to a GitHub *draft* release. Only once both jobs
+# have uploaded their artifacts (including latest.yml / latest-mac.yml) does the
+# final `publish` job flip the draft to a public "Latest" release. This avoids
+# the window where a release is public with only one platform's files, which
+# made Windows clients 404 on latest.yml. Running Warp apps check the releases
+# feed every 15 minutes and auto-update.
 
 on:
   push:
@@ -38,7 +42,7 @@ jobs:
 
   windows:
     runs-on: windows-latest
-    needs: mac   # sequential so both jobs attach to the same release cleanly
+    needs: mac   # sequential so mac creates the draft first and windows attaches to it
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -50,5 +54,16 @@ jobs:
       - run: npm run build:ts
       - run: npm run copy:assets
       - run: npx electron-builder --win --x64 --publish always
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Flip the draft to a public "Latest" release only after both platforms have
+  # uploaded their artifacts, so latest.yml is guaranteed present before any
+  # client sees the release.
+  publish:
+    runs-on: ubuntu-latest
+    needs: [mac, windows]
+    steps:
+      - run: gh release edit "v$APP_VERSION" --repo vixco/warp --draft=false --latest
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

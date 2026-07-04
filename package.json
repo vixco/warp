@@ -39,7 +39,7 @@
         "provider": "github",
         "owner": "vixco",
         "repo": "warp",
-        "releaseType": "release"
+        "releaseType": "draft"
       }
     ],
     "files": [
