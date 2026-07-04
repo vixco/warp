@@ -164,6 +164,39 @@
       </div>
 
       <div class="panel">
+        <div class="title" style="margin-bottom:16px">Audio (host)</div>
+        <div class="field" style="display:flex;align-items:center;gap:12px">
+          <label class="switch">
+            <input type="checkbox" id="setAudioEnabled" checked />
+            <span class="track"></span>
+          </label>
+          <div>
+            <div>Stream system audio to clients</div>
+            <div class="hint">Sound from this computer plays on the client's speakers.</div>
+          </div>
+        </div>
+        <div class="field-row">
+          <div class="field">
+            <label>System audio source</label>
+            <select id="setAudioSource">
+              <option value="auto" selected>Auto (system loopback)</option>
+            </select>
+          </div>
+          <div class="field">
+            <label>Client microphone plays on</label>
+            <select id="setMicSink">
+              <option value="default" selected>Default speakers</option>
+            </select>
+          </div>
+        </div>
+        <div class="hint">
+          "Auto" captures all system sound directly (macOS 13+). Pick a virtual
+          device (e.g. BlackHole) as source/output to route audio into specific
+          apps — for example so a call on this Mac hears the client's microphone.
+        </div>
+      </div>
+
+      <div class="panel">
         <div class="title" style="margin-bottom:16px">Host</div>
         <div class="field-row">
           <div class="field">

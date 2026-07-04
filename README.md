@@ -132,9 +132,42 @@ Notes:
   signing certificate** for auto-install; unsigned Mac builds log the update
   and keep running — install the new dmg manually or add signing later.
 
+## Audio passthrough
+
+Warp streams audio in both directions on the first screen's connection, as a
+stereo Opus track (up to 256 kbps, FEC on, jitter buffer forced to 0 for
+minimal delay):
+
+- **Host system audio → client speakers.** The client picks its output device
+  under *Speakers* in the in-stream menu (Ctrl+Shift+M).
+- **Client microphone → host.** The client picks its input device under
+  *Microphone* in the same menu (default: Off). Live device switching uses
+  `replaceTrack`, so no renegotiation/glitch.
+
+### macOS system-audio capture
+
+macOS has no built-in "record system audio" for third-party apps, so — exactly
+like Sunshine/OBS — Warp captures system sound from a **virtual audio device**.
+Install one (all free) and Warp auto-detects it:
+
+- [BlackHole](https://existential.audio/blackhole/) (recommended), Loopback,
+  Soundflower, or VB-Cable.
+
+Then either:
+
+1. Create a **Multi-Output Device** (Audio MIDI Setup) that plays to both your
+   speakers and BlackHole — so you hear audio locally *and* it streams, or
+2. Set BlackHole as system output (audio only streams, silent locally).
+
+In Warp → Settings → *Audio (host)* you can also pick the source device
+explicitly and choose where the client's microphone plays on the host (handy
+for routing the remote mic into a meeting app via a virtual device).
+
+If no virtual device is present, video/input still work; only system audio is
+silent. The client microphone path needs no host-side driver.
+
 ## Current limitations
 
 - Hosting is macOS-only (Windows/Linux hosting not yet implemented).
-- Audio streaming is not yet wired up.
 - For connections across the internet, forward TCP port 9750 (signaling);
   WebRTC uses STUN for the media path.

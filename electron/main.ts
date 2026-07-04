@@ -1,6 +1,6 @@
 import {
   app, BrowserWindow, ipcMain, screen, desktopCapturer,
-  systemPreferences, shell, clipboard, Tray, Menu, nativeImage,
+  systemPreferences, shell, clipboard, Tray, Menu, nativeImage, session,
 } from 'electron';
 import * as path from 'path';
 import * as fs from 'fs';
@@ -23,6 +23,9 @@ interface Settings {
   hostingEnabled: boolean;
   launchAtLogin: boolean;
   streamMode: 'sharp' | 'smooth';
+  audioEnabled: boolean;
+  audioSource: string;   // 'auto' = system loopback, else input deviceId
+  micSink: string;       // where client mic plays on the host ('default' or deviceId)
 }
 
 const settingsFile = () => path.join(app.getPath('userData'), 'settings.json');
@@ -39,6 +42,9 @@ function loadSettings(): Settings {
     hostingEnabled: false,
     launchAtLogin: true,
     streamMode: 'sharp',
+    audioEnabled: true,
+    audioSource: 'auto',
+    micSink: 'default',
   };
   try {
     return { ...defaults, ...JSON.parse(fs.readFileSync(settingsFile(), 'utf8')) };
@@ -584,6 +590,32 @@ function wireIpc() {
 app.whenReady().then(async () => {
   // No File/Edit/View menu bar on Windows/Linux (Parsec-style chrome-less UI).
   if (process.platform !== 'darwin') Menu.setApplicationMenu(null);
+
+  // System loopback audio for the host engine. The video part of this
+  // getDisplayMedia capture is a small window (never a display — that would
+  // conflict with the per-screen video captures); only the loopback audio
+  // track is used.
+  session.defaultSession.setDisplayMediaRequestHandler(async (_request, callback) => {
+    try {
+      const windows = await desktopCapturer.getSources({
+        types: ['window'],
+        thumbnailSize: { width: 0, height: 0 },
+      });
+      const own = windows.find((w) => w.name.startsWith('Warp')) ?? windows[0];
+      if (own) {
+        callback({ video: own, audio: 'loopback' });
+        return;
+      }
+      const screens = await desktopCapturer.getSources({
+        types: ['screen'],
+        thumbnailSize: { width: 0, height: 0 },
+      });
+      callback({ video: screens[0], audio: 'loopback' });
+    } catch {
+      try { callback({} as any); } catch { /* ignore */ }
+    }
+  });
+
   wireIpc();
   discovery.start();
   discovery.onHostsChanged = (hosts: DiscoveredHost[]) => {
@@ -608,6 +640,11 @@ app.whenReady().then(async () => {
 
   // Automated self-test: stream own primary display into a windowed viewer.
   if (process.argv.includes('--test-loopback')) {
+    // Animated window so the damage-driven encoder has something to encode.
+    const anim = new BrowserWindow({ width: 220, height: 160, x: 40, y: 80, alwaysOnTop: true });
+    anim.loadURL('data:text/html,<style>div{width:60px;height:60px;background:%234f7cff;' +
+      'animation:m 0.8s linear infinite alternate}@keyframes m{to{transform:translate(120px,60px)}}' +
+      '</style><div></div>');
     setTimeout(() => {
       const primary = screen.getPrimaryDisplay();
       const win = new BrowserWindow({

@@ -14,7 +14,10 @@ const P = {
   codec: params.get('codec') || 'h264',
   mode: params.get('mode') || 'sharp',
   label: params.get('label') || 'Warp',
+  screenIndex: Number(params.get('screenIndex')) || 0,
 };
+// Audio passthrough rides on the first screen only (one audio path, not three)
+const WANT_AUDIO = P.screenIndex === 0;
 
 const video = document.getElementById('video') as HTMLVideoElement;
 const statusEl = document.getElementById('status')!;
@@ -48,6 +51,8 @@ function cleanup() {
   try { pc?.close(); } catch { /* ignore */ }
   if (ws) { ws.onclose = null; try { ws.close(); } catch { /* ignore */ } }
   channel = null; pc = null; ws = null;
+  micStream?.getTracks().forEach((t) => t.stop());
+  micStream = null;
 }
 
 function connect() {
@@ -75,6 +80,7 @@ function connect() {
           bitrate: P.bitrate,
           codec: P.codec,
           mode: P.mode,
+          wantAudio: WANT_AUDIO,
         }));
         break;
 
@@ -118,7 +124,13 @@ async function acceptOffer(sdp: string) {
       (e.receiver as any).jitterBufferTarget = 0;
       (e.receiver as any).playoutDelayHint = 0;
     } catch { /* best effort */ }
-    video.srcObject = e.streams[0] || new MediaStream([e.track]);
+    if (e.track.kind === 'audio') {
+      audioEl.srcObject = e.streams[0] || new MediaStream([e.track]);
+      applySink();
+      audioEl.play().catch(() => { /* resumes on first interaction */ });
+      return;
+    }
+    video.srcObject = new MediaStream([e.track]);
     video.play().catch(() => { /* autoplay is allowed (muted) */ });
     hideStatus();
   };
@@ -151,12 +163,106 @@ async function acceptOffer(sdp: string) {
   };
 
   await pc.setRemoteDescription({ type: 'offer', sdp });
+
+  // Attach the microphone (if enabled) to the audio transceiver before
+  // answering, so mic + system audio negotiate in one round trip.
+  if (WANT_AUDIO) await attachMic();
+
   const answer = await pc.createAnswer();
+  answer.sdp = mungeOpus(answer.sdp || '');
   await pc.setLocalDescription(answer);
   ws?.send(JSON.stringify({ type: 'rtc-answer', sessionId: P.sessionId, sdp: answer.sdp }));
 }
 
+// Prefer stereo, high-bitrate, FEC-protected Opus for the audio we receive.
+function mungeOpus(sdp: string): string {
+  return sdp.replace(/a=fmtp:(\d+) minptime=10;useinbandfec=1/g,
+    'a=fmtp:$1 minptime=10;useinbandfec=1;stereo=1;sprop-stereo=1;maxaveragebitrate=256000');
+}
+
 statusRetry.addEventListener('click', () => connect());
+
+// ---------------------------------------------------------------------------
+// Audio: host system audio -> chosen speakers; chosen microphone -> host
+
+const audioEl = new Audio();
+audioEl.autoplay = true;
+
+let micStream: MediaStream | null = null;
+
+function savedSink(): string { return localStorage.getItem('audio:sink') || 'default'; }
+function savedMic(): string { return localStorage.getItem('audio:mic') || 'off'; }
+
+function applySink() {
+  const sink = savedSink();
+  if (sink !== 'default') {
+    (audioEl as any).setSinkId?.(sink).catch(() => { /* device gone: default */ });
+  } else {
+    (audioEl as any).setSinkId?.('').catch(() => { /* ignore */ });
+  }
+}
+
+function audioTransceiver(): RTCRtpTransceiver | undefined {
+  return pc?.getTransceivers().find((t) =>
+    t.receiver.track?.kind === 'audio' || t.sender.track?.kind === 'audio');
+}
+
+async function attachMic() {
+  const micId = savedMic();
+  const tr = audioTransceiver();
+  if (!tr) return;
+  micStream?.getTracks().forEach((t) => t.stop());
+  micStream = null;
+  if (micId === 'off') {
+    await tr.sender.replaceTrack(null).catch(() => { /* ignore */ });
+    return;
+  }
+  try {
+    micStream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        deviceId: micId === 'default' ? undefined : { exact: micId },
+        echoCancellation: true,   // avoid feeding host audio back to the host
+        noiseSuppression: true,
+        autoGainControl: true,
+      },
+    });
+    tr.direction = 'sendrecv';
+    await tr.sender.replaceTrack(micStream.getAudioTracks()[0]);
+  } catch (err) {
+    console.warn('microphone unavailable', err);
+  }
+}
+
+async function populateAudioDevices() {
+  const spk = document.getElementById('menuSpeakers') as HTMLSelectElement;
+  const mic = document.getElementById('menuMic') as HTMLSelectElement;
+  if (!spk || !mic) return;
+  try {
+    // A brief mic open makes device labels available on first run.
+    if (!localStorage.getItem('audio:labels')) {
+      try {
+        const probe = await navigator.mediaDevices.getUserMedia({ audio: true });
+        probe.getTracks().forEach((t) => t.stop());
+        localStorage.setItem('audio:labels', '1');
+      } catch { /* no mic permission — generic labels */ }
+    }
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    spk.innerHTML = '';
+    spk.add(new Option('System default', 'default'));
+    devices.filter((d) => d.kind === 'audiooutput' && d.deviceId !== 'default')
+      .forEach((d, i) => spk.add(new Option(d.label || `Speakers ${i + 1}`, d.deviceId)));
+    spk.value = savedSink();
+    if (!spk.value) spk.value = 'default';
+
+    mic.innerHTML = '';
+    mic.add(new Option('Off', 'off'));
+    mic.add(new Option('System default', 'default'));
+    devices.filter((d) => d.kind === 'audioinput' && d.deviceId !== 'default')
+      .forEach((d, i) => mic.add(new Option(d.label || `Microphone ${i + 1}`, d.deviceId)));
+    mic.value = savedMic();
+    if (!mic.value) mic.value = 'off';
+  } catch { /* leave menus empty */ }
+}
 
 // ---------------------------------------------------------------------------
 // Input capture
@@ -297,8 +403,26 @@ function toggleMenu(open = !menuOpen) {
   menuOpen = open;
   menuEl.classList.toggle('hidden', !menuOpen);
   document.body.classList.toggle('show-cursor', menuOpen);
-  if (menuOpen) sendInput({ t: 'reset' }); // release held keys/buttons
+  if (menuOpen) {
+    sendInput({ t: 'reset' }); // release held keys/buttons
+    populateAudioDevices();
+  }
 }
+
+// Audio device rows only exist on the screen that carries audio.
+if (!WANT_AUDIO) {
+  document.getElementById('rowSpeakers')!.style.display = 'none';
+  document.getElementById('rowMic')!.style.display = 'none';
+}
+
+document.getElementById('menuSpeakers')!.addEventListener('change', (e) => {
+  localStorage.setItem('audio:sink', (e.target as HTMLSelectElement).value);
+  applySink();
+});
+document.getElementById('menuMic')!.addEventListener('change', async (e) => {
+  localStorage.setItem('audio:mic', (e.target as HTMLSelectElement).value);
+  await attachMic();
+});
 
 function sendCfg() {
   sendInput({
@@ -322,8 +446,11 @@ setInterval(async () => {
   if (!pc || pc.connectionState !== 'connected') { ovStats.textContent = '—'; return; }
   try {
     const stats = await pc.getStats();
-    let fps = 0, kbps = 0, rttMs = -1, w = 0, h = 0;
+    let fps = 0, kbps = 0, rttMs = -1, w = 0, h = 0, audioBytes = 0;
     stats.forEach((s: any) => {
+      if (s.type === 'inbound-rtp' && s.kind === 'audio') {
+        audioBytes = s.bytesReceived || 0;
+      }
       if (s.type === 'inbound-rtp' && s.kind === 'video') {
         const now = s.timestamp;
         if (lastTs) {
@@ -347,7 +474,7 @@ setInterval(async () => {
     ovStats.textContent = statsText;
     document.getElementById('menuStats')!.textContent = statsText;
     if (params.has('debug')) {
-      console.log(`warp-stats ${JSON.stringify({ w, h, fps, kbps, rttMs })}`);
+      console.log(`warp-stats ${JSON.stringify({ w, h, fps, kbps, rttMs, audioBytes })}`);
     }
   } catch { /* ignore */ }
 }, 1000);

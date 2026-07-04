@@ -44,6 +44,33 @@ async function loadSettingsUi() {
   ($('#setPairingCode') as HTMLInputElement).value = settings.pairingCode;
   ($('#setHidpi') as HTMLInputElement).checked = !!settings.hidpiVirtual;
   ($('#setLaunchAtLogin') as HTMLInputElement).checked = !!settings.launchAtLogin;
+  ($('#setAudioEnabled') as HTMLInputElement).checked = settings.audioEnabled !== false;
+  await populateHostAudioDevices();
+  ($('#setAudioSource') as HTMLSelectElement).value = settings.audioSource || 'auto';
+  if (!($('#setAudioSource') as HTMLSelectElement).value) {
+    ($('#setAudioSource') as HTMLSelectElement).value = 'auto';
+  }
+  ($('#setMicSink') as HTMLSelectElement).value = settings.micSink || 'default';
+  if (!($('#setMicSink') as HTMLSelectElement).value) {
+    ($('#setMicSink') as HTMLSelectElement).value = 'default';
+  }
+}
+
+async function populateHostAudioDevices() {
+  try {
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    const src = $('#setAudioSource') as HTMLSelectElement;
+    src.innerHTML = '';
+    src.add(new Option('Auto (system loopback)', 'auto'));
+    devices.filter((d) => d.kind === 'audioinput' && d.deviceId !== 'default')
+      .forEach((d, i) => src.add(new Option(d.label || `Audio input ${i + 1}`, d.deviceId)));
+
+    const sink = $('#setMicSink') as HTMLSelectElement;
+    sink.innerHTML = '';
+    sink.add(new Option('Default speakers', 'default'));
+    devices.filter((d) => d.kind === 'audiooutput' && d.deviceId !== 'default')
+      .forEach((d, i) => sink.add(new Option(d.label || `Audio output ${i + 1}`, d.deviceId)));
+  } catch { /* keep defaults */ }
 }
 
 $('#saveSettingsBtn').addEventListener('click', async () => {
@@ -57,6 +84,9 @@ $('#saveSettingsBtn').addEventListener('click', async () => {
     pairingCode: ($('#setPairingCode') as HTMLInputElement).value.replace(/\D/g, ''),
     hidpiVirtual: ($('#setHidpi') as HTMLInputElement).checked,
     launchAtLogin: ($('#setLaunchAtLogin') as HTMLInputElement).checked,
+    audioEnabled: ($('#setAudioEnabled') as HTMLInputElement).checked,
+    audioSource: ($('#setAudioSource') as HTMLSelectElement).value,
+    micSink: ($('#setMicSink') as HTMLSelectElement).value,
   });
   toast('Settings saved');
 });
@@ -186,6 +216,8 @@ interface HostSession {
   displayId: number;
   sender: RTCRtpSender | null;
   track: MediaStreamTrack | null;
+  audioStream: MediaStream | null;   // system audio being sent to the client
+  micPlayer: HTMLAudioElement | null; // client microphone played on the host
 }
 
 class HostEngine {
@@ -244,22 +276,45 @@ class HostEngine {
 
     const fps = Number(msg.fps) || 60;
     const src = source as any;
-    const stream = await (navigator.mediaDevices as any).getUserMedia({
-      audio: false,
-      video: {
-        mandatory: {
-          chromeMediaSource: 'desktop',
-          chromeMediaSourceId: src.id,
-          // Pin to the display's physical pixel size so Retina/HiDPI displays
-          // stream at full resolution instead of logical points.
-          minWidth: src.width || 640,
-          minHeight: src.height || 480,
-          maxWidth: src.width || 8192,
-          maxHeight: src.height || 8192,
-          maxFrameRate: fps,
+    const hostSettings = await warp.getSettings();
+    const wantAudio = !!msg.wantAudio;
+    const audioSource = hostSettings.audioSource || 'auto';
+    const useLoopback = wantAudio && hostSettings.audioEnabled !== false &&
+      audioSource === 'auto';
+
+    // Pin capture to the display's physical pixel size so Retina/HiDPI
+    // displays stream at full resolution instead of logical points.
+    const legacyCapture = async (): Promise<MediaStream> =>
+      await (navigator.mediaDevices as any).getUserMedia({
+        audio: false,
+        video: {
+          mandatory: {
+            chromeMediaSource: 'desktop',
+            chromeMediaSourceId: src.id,
+            minWidth: src.width || 640,
+            minHeight: src.height || 480,
+            maxWidth: src.width || 8192,
+            maxHeight: src.height || 8192,
+            maxFrameRate: fps,
+          },
         },
-      },
-    }) as MediaStream;
+      }) as MediaStream;
+
+    const stream = await legacyCapture();
+
+    // System audio: captured from a virtual audio device (BlackHole & co) via
+    // plain getUserMedia. Note: SCK loopback (getDisplayMedia audio) stalls
+    // ALL screen capture on recent macOS + Electron, so it is not used.
+    let audioTrack: MediaStreamTrack | null = null;
+    let audioCapture: MediaStream | null = null;
+    if (wantAudio && hostSettings.audioEnabled !== false) {
+      let deviceId: string | null = audioSource;
+      if (useLoopback) deviceId = await findVirtualAudioDevice();
+      if (deviceId && deviceId !== 'auto') {
+        audioCapture = await this.captureSystemAudio(deviceId);
+        audioTrack = audioCapture?.getAudioTracks()[0] ?? null;
+      }
+    }
 
     const track = stream.getVideoTracks()[0];
     // 'detail' preserves text sharpness at high bitrate; 'smooth' favors
@@ -271,6 +326,7 @@ class HostEngine {
     });
     const session: HostSession = {
       pc, stream, channel: null, displayId, sender: null, track,
+      audioStream: audioCapture, micPlayer: null,
     };
     this.sessions.set(sessionId, session);
 
@@ -284,6 +340,30 @@ class HostEngine {
     });
     session.sender = transceiver.sender;
     preferCodec(transceiver, String(msg.codec || 'h264'));
+
+    // Audio passthrough rides on the first screen's connection only:
+    // host system audio -> client, client microphone -> host.
+    if (wantAudio) {
+      // sendrecv even without a host track so the client can still send mic.
+      const audioTransceiver = pc.addTransceiver(audioTrack ?? 'audio', {
+        direction: 'sendrecv',
+      });
+      void audioTransceiver;
+
+      pc.ontrack = (e) => {
+        if (e.track.kind !== 'audio') return;
+        try { (e.receiver as any).jitterBufferTarget = 0; } catch { /* ignore */ }
+        const player = new Audio();
+        player.srcObject = e.streams[0] || new MediaStream([e.track]);
+        player.autoplay = true;
+        const sink = hostSettings.micSink;
+        if (sink && sink !== 'default') {
+          (player as any).setSinkId?.(sink).catch(() => { /* fall back to default */ });
+        }
+        session.micPlayer?.pause();
+        session.micPlayer = player;
+      };
+    }
 
     pc.onicecandidate = (e) => {
       if (e.candidate) {
@@ -360,6 +440,26 @@ class HostEngine {
     } catch (err) { console.warn('applyConfig failed', err); }
   }
 
+  // System audio from a dedicated input device (e.g. a BlackHole virtual
+  // device). The 'auto' loopback path is handled inside startScreen, where
+  // audio is captured together with the video in a single stream.
+  private async captureSystemAudio(deviceId: string): Promise<MediaStream | null> {
+    try {
+      return await navigator.mediaDevices.getUserMedia({
+        audio: {
+          deviceId: { exact: deviceId },
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: false,
+          channelCount: 2,
+        },
+      });
+    } catch (err) {
+      console.warn('system audio capture unavailable:', err);
+      return null;
+    }
+  }
+
   stopScreen(sessionId: string) {
     const s = this.sessions.get(sessionId);
     if (!s) return;
@@ -367,12 +467,27 @@ class HostEngine {
     try { s.channel?.close(); } catch { /* ignore */ }
     try { s.pc.close(); } catch { /* ignore */ }
     s.stream?.getTracks().forEach((t) => t.stop());
+    s.audioStream?.getTracks().forEach((t) => t.stop());
+    if (s.micPlayer) { s.micPlayer.pause(); s.micPlayer.srcObject = null; }
     warp.injectInput({ t: 'reset' });
   }
 
   stopAll() {
     for (const id of [...this.sessions.keys()]) this.stopScreen(id);
   }
+}
+
+// Auto-detect a virtual loopback audio device (the Sunshine/OBS approach for
+// macOS system audio): BlackHole, Loopback, Soundflower, VB-Cable, …
+async function findVirtualAudioDevice(): Promise<string | null> {
+  try {
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    const virtual = devices.find((d) =>
+      d.kind === 'audioinput' &&
+      /blackhole|loopback|soundflower|vb-?cable|virtual/i.test(d.label));
+    if (virtual) console.log(`system audio via virtual device: ${virtual.label}`);
+    return virtual?.deviceId ?? null;
+  } catch { return null; }
 }
 
 function preferCodec(transceiver: RTCRtpTransceiver, codec: string) {
