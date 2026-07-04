@@ -30,20 +30,25 @@
   "build": {
     "appId": "nl.tovix.warp",
     "productName": "Warp",
+    "directories": {
+      "output": "release"
+    },
     "files": [
       "dist/**/*",
+      "!dist/win-unpacked",
+      "!dist/mac*",
       "package.json"
     ],
-    "extraResources": [
-      {
-        "from": "native/bin",
-        "to": "native",
-        "filter": [
-          "**/*"
-        ]
-      }
-    ],
     "mac": {
+      "extraResources": [
+        {
+          "from": "native/bin",
+          "to": "native",
+          "filter": [
+            "**/*"
+          ]
+        }
+      ],
       "category": "public.app-category.utilities",
       "target": [
         "dmg",
