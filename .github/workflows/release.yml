@@ -59,11 +59,30 @@ jobs:
 
   # Flip the draft to a public "Latest" release only after both platforms have
   # uploaded their artifacts, so latest.yml is guaranteed present before any
-  # client sees the release.
+  # client sees the release. Also stamp the macOS install note into the body:
+  # without an Apple Developer ID the build is only ad-hoc signed, so macOS
+  # Gatekeeper quarantines the browser download and shows "Warp is damaged"
+  # until the user strips the quarantine flag once.
   publish:
     runs-on: ubuntu-latest
     needs: [mac, windows]
     steps:
-      - run: gh release edit "v$APP_VERSION" --repo vixco/warp --draft=false --latest
+      - name: Publish with install notes
+        run: |
+          gh release edit "v$APP_VERSION" --repo vixco/warp --draft=false --latest --notes '## Install
+
+          ### macOS
+
+          The build is ad-hoc signed (no Apple Developer ID), so macOS Gatekeeper quarantines the browser download and may show **“Warp is damaged”**. Clear the quarantine flag once **before** opening the dmg:
+
+          ```sh
+          xattr -cr ~/Downloads/Warp-*-arm64.dmg
+          ```
+
+          Then open the dmg, drag Warp to Applications, and launch.
+
+          ### Windows
+
+          Run the `Warp-Setup-*.exe` installer — it opens without a signature warning.'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

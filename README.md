@@ -135,16 +135,25 @@ Notes:
 ### Opening the macOS dmg (no Apple Developer ID)
 
 The CI build has no signing certificate, so it ad-hoc seals the `.app`
-(`scripts/adhoc-sign.cjs`). macOS Gatekeeper still quarantines the download
-because it isn't notarized — on first open you'll see "*Warp* cannot be
-opened because the developer cannot be verified" (or "damaged"). Either:
+(`scripts/adhoc-sign.cjs`). The seal itself is valid — but because the app is
+not *notarized* by Apple, macOS Gatekeeper quarantines the browser download and
+refuses to open it. On Apple Silicon this shows up as "*Warp* is damaged and
+can't be opened" (the right-click → *Open* bypass does **not** work for ad-hoc
+apps there). Strip the quarantine flag once and it opens normally.
 
-- **Right-click** Warp.app → *Open* → *Open* in the dialog, **or**
-- strip the quarantine flag once after dragging it to Applications:
+Easiest — clear it from the downloaded dmg **before** you open it, so the app
+inside never inherits quarantine:
 
-  ```sh
-  xattr -dr com.apple.quarantine /Applications/Warp.app
-  ```
+```sh
+xattr -cr ~/Downloads/Warp-*-arm64.dmg
+```
+
+…then double-click the dmg, drag Warp to Applications, and launch. Alternatively
+strip it from the installed app after dragging:
+
+```sh
+xattr -dr com.apple.quarantine /Applications/Warp.app
+```
 
 A paid Apple Developer ID + notarization would remove this step entirely.
 
