@@ -177,6 +177,15 @@ warp.onUpdateReady((version) => {
   $('#updRestartBtn').style.display = 'inline-flex';
 });
 
+// On unsigned macOS builds, quitAndInstall() silently no-ops. The main process
+// detects that, opens the releases page in the browser, and fires this event
+// so we can tell the user what just happened instead of leaving them with a
+// button that does nothing.
+warp.onUpdateInstallFailed(() => {
+  $('#updStatus').textContent = 'Auto-install unavailable — download page opened';
+  toast('Auto-install not available on this build — download page opened. Install manually.', true);
+});
+
 // ---------------------------------------------------------------------------
 // Updates panel
 
@@ -275,32 +284,20 @@ class HostEngine {
     }
 
     const fps = Number(msg.fps) || 60;
-    const src = source as any;
     const hostSettings = await warp.getSettings();
     const wantAudio = !!msg.wantAudio;
     const audioSource = hostSettings.audioSource || 'auto';
     const useLoopback = wantAudio && hostSettings.audioEnabled !== false &&
       audioSource === 'auto';
 
-    // Pin capture to the display's physical pixel size so Retina/HiDPI
-    // displays stream at full resolution instead of logical points.
-    const legacyCapture = async (): Promise<MediaStream> =>
-      await (navigator.mediaDevices as any).getUserMedia({
-        audio: false,
-        video: {
-          mandatory: {
-            chromeMediaSource: 'desktop',
-            chromeMediaSourceId: src.id,
-            minWidth: src.width || 640,
-            minHeight: src.height || 480,
-            maxWidth: src.width || 8192,
-            maxHeight: src.height || 8192,
-            maxFrameRate: fps,
-          },
-        },
-      }) as MediaStream;
-
-    const stream = await legacyCapture();
+    // Capture the display with the OS cursor suppressed (Parsec-style: the
+    // client renders its own zero-lag cursor, so the host cursor must not be
+    // baked into the frames). getDisplayMedia honors `cursor: 'never'` via
+    // ScreenCaptureKit on modern macOS; the legacy chromeMediaSource path
+    // does not. The main process picks the source for this display via the
+    // displayMediaRequestHandler — we queue the displayId first, and
+    // serialize captures so that single-slot matching is race-free.
+    const stream = await captureDisplay(displayId);
 
     // System audio: captured from a virtual audio device (BlackHole & co) via
     // plain getUserMedia. Note: SCK loopback (getDisplayMedia audio) stalls
@@ -382,7 +379,7 @@ class HostEngine {
     warp.toSession(sessionId, { type: 'rtc-offer', sdp: offer.sdp });
 
     // Apply bitrate/framerate caps once connected.
-    const mbps = Number(msg.bitrate) || 50;
+    const mbps = Number(msg.bitrate) || 150;
     const sender = transceiver.sender;
     const applyParams = async () => {
       try {
@@ -490,13 +487,42 @@ async function findVirtualAudioDevice(): Promise<string | null> {
   } catch { return null; }
 }
 
+// Capture a display via getDisplayMedia with the OS cursor suppressed
+// (Parsec-style local-cursor streaming). Captures are serialized so the
+// main-process displayMediaRequestHandler can match each request to the
+// single queued displayId without races.
+let captureChain: Promise<unknown> = Promise.resolve();
+function captureDisplay(displayId: number): Promise<MediaStream> {
+  const run = captureChain.then(async () => {
+    warp.queueCaptureDisplay(displayId);
+    return await navigator.mediaDevices.getDisplayMedia({
+      video: { cursor: 'never' } as any,
+      audio: false,
+    });
+  });
+  captureChain = run.catch(() => { /* keep the chain alive on failure */ });
+  return run as Promise<MediaStream>;
+}
+
 function preferCodec(transceiver: RTCRtpTransceiver, codec: string) {
   const mime = codec === 'av1' ? 'video/av1' : codec === 'vp9' ? 'video/vp9' : 'video/h264';
   try {
     // setCodecPreferences requires a subset of the *receiver* capabilities.
     const caps = RTCRtpReceiver.getCapabilities('video');
     if (!caps) return;
+    const isH264 = mime === 'video/h264';
     const preferred = caps.codecs.filter((c) => c.mimeType.toLowerCase() === mime);
+    // For H.264, put High profile (level-idc 64xxxx) ahead of Constrained
+    // Baseline (42xxxx). High profile compresses far more efficiently — same
+    // bitrate yields a visibly sharper picture, which matters most for text.
+    if (isH264 && preferred.length > 1) {
+      const rank = (p: string | undefined) => {
+        const m = p ? /profile-level-id=([0-9a-f]{6})/i.exec(p) : null;
+        const prof = m ? m[1].slice(0, 2) : 'ff';
+        return prof === '64' ? 0 : prof === '4e' ? 1 : prof === '42' ? 2 : 3;
+      };
+      preferred.sort((a, b) => rank(a.sdpFmtpLine) - rank(b.sdpFmtpLine));
+    }
     const rest = caps.codecs.filter((c) => c.mimeType.toLowerCase() !== mime);
     if (preferred.length) transceiver.setCodecPreferences([...preferred, ...rest]);
   } catch { /* codec preference is best-effort */ }

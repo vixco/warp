@@ -15,6 +15,8 @@ contextBridge.exposeInMainWorld('warp', {
     ipcRenderer.on('hosting-stopped', () => fn()),
   onUpdateReady: (fn: (version: string) => void) =>
     ipcRenderer.on('update-ready', (_e, v) => fn(v)),
+  onUpdateInstallFailed: (fn: () => void) =>
+    ipcRenderer.on('update-install-failed', () => fn()),
   checkForUpdates: () => ipcRenderer.invoke('check-for-updates'),
   getAppVersion: () => ipcRenderer.invoke('get-app-version'),
   installUpdate: () => ipcRenderer.invoke('install-update'),
@@ -26,6 +28,8 @@ contextBridge.exposeInMainWorld('warp', {
     ipcRenderer.send('to-session', { sessionId, msg }),
   getCaptureSource: (displayId: number) =>
     ipcRenderer.invoke('get-capture-source', displayId),
+  queueCaptureDisplay: (displayId: number) =>
+    ipcRenderer.send('set-pending-capture-display', displayId),
   injectInput: (ev: any) => ipcRenderer.send('input-event', ev),
 
   // discovery / client

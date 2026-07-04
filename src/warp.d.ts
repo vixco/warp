@@ -7,6 +7,7 @@ export interface WarpApi {
   onHostState(fn: (s: any) => void): void;
   onHostingStopped(fn: () => void): void;
   onUpdateReady(fn: (version: string) => void): void;
+  onUpdateInstallFailed(fn: () => void): void;
   checkForUpdates(): Promise<{
     ok: boolean; currentVersion: string; latestVersion?: string;
     updateAvailable?: boolean; downloaded?: boolean; error?: string;
@@ -16,6 +17,7 @@ export interface WarpApi {
   onEngineMessage(fn: (data: { sessionId: string; msg: any }) => void): void;
   toSession(sessionId: string, msg: any): void;
   getCaptureSource(displayId: number): Promise<{ id: string; name: string } | null>;
+  queueCaptureDisplay(displayId: number): void;
   injectInput(ev: any): void;
   getDiscoveredHosts(): Promise<any[]>;
   onDiscoveredHosts(fn: (hosts: any[]) => void): void;

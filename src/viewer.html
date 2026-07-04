@@ -10,6 +10,20 @@
     html, body { height: 100%; background: #000; overflow: hidden; cursor: none; }
     body.show-cursor { cursor: default; }
 
+    /* Parsec-style local cursor: rendered client-side so it tracks the
+       pointer with zero lag (the host cursor is suppressed in the stream).
+       Shaped like the macOS arrow; the SVG tip sits at the element origin so
+       translating it to (clientX, clientY) puts the hotspot under the pointer. */
+    #localCursor {
+      position: fixed; top: 0; left: 0;
+      width: 22px; height: 22px;
+      pointer-events: none; z-index: 50;
+      transform: translate(-100px, -100px);
+      will-change: transform;
+      filter: drop-shadow(0 1px 1px rgba(0,0,0,0.35));
+    }
+    #localCursor.hidden { display: none; }
+
     video {
       width: 100vw; height: 100vh;
       object-fit: contain;
@@ -139,7 +153,10 @@
         <option value="25">25 Mbps</option>
         <option value="50">50 Mbps</option>
         <option value="100">100 Mbps</option>
-        <option value="200">200 Mbps</option>
+        <option value="150">150 Mbps</option>
+        <option value="300">300 Mbps</option>
+        <option value="400">400 Mbps</option>
+        <option value="600">600 Mbps</option>
       </select>
     </div>
     <div class="menu-row">

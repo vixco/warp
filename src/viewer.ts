@@ -10,7 +10,7 @@ const P = {
   code: params.get('code') || '',
   displayId: Number(params.get('displayId')) || 0,
   fps: Number(params.get('fps')) || 60,
-  bitrate: Number(params.get('bitrate')) || 50,
+  bitrate: Number(params.get('bitrate')) || 150,
   codec: params.get('codec') || 'h264',
   mode: params.get('mode') || 'sharp',
   label: params.get('label') || 'Warp',
@@ -395,7 +395,7 @@ const menuFps = document.getElementById('menuFps') as HTMLSelectElement;
 const menuMode = document.getElementById('menuMode') as HTMLSelectElement;
 document.getElementById('menuLabel')!.textContent = P.label;
 
-menuBitrate.value = [25, 50, 100, 200].includes(P.bitrate) ? String(P.bitrate) : '100';
+menuBitrate.value = [25, 50, 100, 150, 300, 400, 600].includes(P.bitrate) ? String(P.bitrate) : '150';
 menuFps.value = P.fps === 30 ? '30' : '60';
 menuMode.value = P.mode === 'smooth' ? 'smooth' : 'sharp';
 

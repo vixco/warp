@@ -1,6 +1,6 @@
 import {
   app, BrowserWindow, ipcMain, screen, desktopCapturer,
-  systemPreferences, shell, clipboard, Tray, Menu, nativeImage, session,
+  systemPreferences, shell, clipboard, Tray, Menu, nativeImage, session, powerMonitor,
 } from 'electron';
 import * as path from 'path';
 import * as fs from 'fs';
@@ -36,7 +36,7 @@ function loadSettings(): Settings {
     port: 9750,
     pairingCode: '',
     fps: 60,
-    maxBitrateMbps: 100,
+    maxBitrateMbps: 150,
     codec: 'h264',
     hidpiVirtual: false,
     hostingEnabled: false,
@@ -64,11 +64,18 @@ let mainWindow: BrowserWindow | null = null;
 let tray: Tray | null = null;
 let isQuitting = false;
 let updateReadyVersion: string | null = null;
+let pendingInstall = false; // set while we're attempting quitAndInstall()
+const RELEASES_URL = 'https://github.com/vixco/warp/releases/latest';
 const viewerWindows = new Map<string, BrowserWindow>(); // sessionId -> window
 let hostServer: HostServer | null = null;
 let sessionCode = '';
 const vdisplayTokens = new Map<number, number>(); // displayId -> helper token
 let lastClipboardText = '';
+// Display the next video-only getDisplayMedia call should capture. Set by the
+// host engine right before it calls getDisplayMedia; consumed by the
+// displayMediaRequestHandler. The renderer serializes captures, so a single
+// slot is race-free.
+let pendingCaptureDisplayId: number | null = null;
 
 // ---------------------------------------------------------------------------
 // Displays
@@ -251,6 +258,7 @@ function setupAutoUpdater() {
   autoUpdater.on('error', (err) => {
     // Unsigned macOS builds can't auto-install; log and carry on.
     console.error('auto-update:', err?.message || err);
+    if (pendingInstall) triggerInstallFallback();
   });
 
   const check = () => autoUpdater.checkForUpdates().catch(() => { /* offline */ });
@@ -283,6 +291,31 @@ async function checkForUpdatesNow(): Promise<{
   }
 }
 
+// On an unsigned macOS build, quitAndInstall() logs an error and silently
+// no-ops (Squirrel.Mac won't replace the app with an unsigned bundle). Detect
+// that — we're still alive shortly after the call — and fall back to opening
+// the releases page so the user can install manually instead of staring at a
+// button that does nothing.
+function triggerInstallFallback() {
+  if (!pendingInstall) return;
+  pendingInstall = false;
+  isQuitting = false; // we're not actually quitting; undo the flag
+  shell.openExternal(RELEASES_URL).catch(() => { /* offline */ });
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('update-install-failed');
+  }
+}
+
+function installUpdateNow() {
+  if (!updateReadyVersion) return;
+  pendingInstall = true;
+  isQuitting = true;
+  autoUpdater.quitAndInstall();
+  // If quitAndInstall silently no-ops (unsigned macOS), we'll still be alive
+  // here — fall back to the manual-download path.
+  setTimeout(() => { if (pendingInstall) triggerInstallFallback(); }, 2500);
+}
+
 // ---------------------------------------------------------------------------
 // Login item + tray
 
@@ -311,6 +344,12 @@ function refreshTrayMenu() {
   if (!tray) return;
   const hosting = !!hostServer?.running;
   tray.setToolTip(hosting ? `Warp — hosting on (${sessionCode})` : 'Warp');
+  const powerLine = process.platform === 'darwin' && hosting
+    ? [{ label: powerMonitor.onBatteryPower
+        ? 'On battery — will sleep if lid closed'
+        : 'On AC power — lid-close safe',
+        enabled: false }]
+    : [];
   tray.setContextMenu(Menu.buildFromTemplate([
     { label: 'Open Warp', click: () => showMainWindow() },
     { type: 'separator' },
@@ -320,6 +359,7 @@ function refreshTrayMenu() {
       checked: hosting,
       click: () => { hosting ? stopHosting() : startHosting(); },
     }] : []),
+    ...powerLine,
     {
       label: 'Start at login',
       type: 'checkbox',
@@ -336,7 +376,7 @@ function refreshTrayMenu() {
       { type: 'separator' as const },
       {
         label: `Restart to update (v${updateReadyVersion})`,
-        click: () => { isQuitting = true; autoUpdater.quitAndInstall(); },
+        click: () => { installUpdateNow(); },
       },
     ] : []),
     { type: 'separator' },
@@ -572,11 +612,14 @@ function wireIpc() {
 
   ipcMain.handle('check-for-updates', () => checkForUpdatesNow());
   ipcMain.handle('get-app-version', () => app.getVersion());
-  ipcMain.handle('install-update', () => {
-    if (updateReadyVersion) { isQuitting = true; autoUpdater.quitAndInstall(); }
-  });
+  ipcMain.handle('install-update', () => { installUpdateNow(); });
 
   ipcMain.handle('get-clipboard', () => clipboard.readText());
+  // Renderer tells us which display the next video-only getDisplayMedia call
+  // should capture (Parsec-style per-screen streaming, cursor suppressed).
+  ipcMain.on('set-pending-capture-display', (_e, displayId: number) => {
+    pendingCaptureDisplayId = displayId;
+  });
   ipcMain.on('set-clipboard', (_e, text: string) => {
     if (typeof text === 'string' && text !== lastClipboardText) {
       lastClipboardText = text;
@@ -591,11 +634,37 @@ app.whenReady().then(async () => {
   // No File/Edit/View menu bar on Windows/Linux (Parsec-style chrome-less UI).
   if (process.platform !== 'darwin') Menu.setApplicationMenu(null);
 
-  // System loopback audio for the host engine. The video part of this
-  // getDisplayMedia capture is a small window (never a display — that would
-  // conflict with the per-screen video captures); only the loopback audio
-  // track is used.
-  session.defaultSession.setDisplayMediaRequestHandler(async (_request, callback) => {
+  // Single displayMedia handler serves two callers, told apart by whether
+  // audio was requested:
+  //  • Per-screen video capture (host streaming): video only, cursor
+  //    suppressed (Parsec-style — the client renders its own zero-lag
+  //    cursor). The renderer queues the target displayId over IPC before
+  //    the getDisplayMedia call so we can pick the right screen with no
+  //    system picker. Captures are serialized in the renderer, so a single
+  //    pending slot is race-free.
+  //  • Loopback system audio (legacy path): capture a small window + system
+  //    audio. Never a display — that would conflict with the per-screen
+  //    captures. Only the loopback audio track is used.
+  session.defaultSession.setDisplayMediaRequestHandler(async (request, callback) => {
+    if (!request.audioRequested) {
+      const want = pendingCaptureDisplayId;
+      pendingCaptureDisplayId = null;
+      try {
+        const sources = await desktopCapturer.getSources({
+          types: ['screen'],
+          thumbnailSize: { width: 0, height: 0 },
+        });
+        let src = sources[0];
+        if (want != null) {
+          src = sources.find((s) => String(s.display_id) === String(want)) || sources[0];
+        }
+        if (!src) { try { callback({} as any); } catch { /* ignore */ } return; }
+        callback({ video: src });
+      } catch {
+        try { callback({} as any); } catch { /* ignore */ }
+      }
+      return;
+    }
     try {
       const windows = await desktopCapturer.getSources({
         types: ['window'],
@@ -633,6 +702,17 @@ app.whenReady().then(async () => {
 
   screen.on('display-added', () => pushHostState());
   screen.on('display-removed', () => pushHostState());
+
+  // Re-arm the keep-awake assertion after the system wakes or switches to AC,
+  // and refresh the tray so the power-state line stays accurate. This is what
+  // makes lid-close streaming survive: even if macOS tore down caffeinate's
+  // assertion on sleep, it gets re-asserted the instant we resume.
+  if (process.platform === 'darwin') {
+    powerMonitor.on('resume', () => { helpers.ensureAwake(); refreshTrayMenu(); });
+    powerMonitor.on('on-ac', () => { helpers.ensureAwake(); refreshTrayMenu(); });
+    powerMonitor.on('on-battery', () => refreshTrayMenu());
+    powerMonitor.on('suspend', () => refreshTrayMenu());
+  }
 
   if (settings.hostingEnabled && process.platform === 'darwin') {
     await startHosting();
@@ -682,6 +762,7 @@ app.on('window-all-closed', () => {
 
 app.on('before-quit', () => {
   isQuitting = true;
+  pendingInstall = false; // quit is really happening — cancel the fallback timer
   stopHosting(false); // keep the hosting preference for next launch
   discovery.stop();
 });
