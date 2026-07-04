@@ -1,0 +1,54 @@
+name: Release
+
+# Every push to the main development branch builds installers for macOS and
+# Windows and publishes them as a GitHub release. Running Warp apps check the
+# releases feed every 15 minutes and auto-update.
+
+on:
+  push:
+    branches: [warp-app, main]
+
+concurrency:
+  group: release
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+env:
+  # Monotonically increasing version so electron-updater always sees the
+  # newest push as an upgrade.
+  APP_VERSION: 0.1.${{ github.run_number }}
+
+jobs:
+  mac:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm version "$APP_VERSION" --no-git-tag-version
+      - run: npm run build
+      - run: npx electron-builder --mac --publish always
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  windows:
+    runs-on: windows-latest
+    needs: mac   # sequential so both jobs attach to the same release cleanly
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm version "$env:APP_VERSION" --no-git-tag-version
+      - run: npm run build:ts
+      - run: npm run copy:assets
+      - run: npx electron-builder --win --x64 --publish always
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

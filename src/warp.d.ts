@@ -6,6 +6,7 @@ export interface WarpApi {
   stopHosting(): Promise<void>;
   onHostState(fn: (s: any) => void): void;
   onHostingStopped(fn: () => void): void;
+  onUpdateReady(fn: (version: string) => void): void;
   onEngineMessage(fn: (data: { sessionId: string; msg: any }) => void): void;
   toSession(sessionId: string, msg: any): void;
   getCaptureSource(displayId: number): Promise<{ id: string; name: string } | null>;

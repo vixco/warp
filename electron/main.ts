@@ -5,6 +5,7 @@ import {
 import * as path from 'path';
 import * as fs from 'fs';
 import * as os from 'os';
+import { autoUpdater } from 'electron-updater';
 import { NativeHelpers } from './helpers';
 import { Discovery, DiscoveredHost, primaryLanIp } from './discovery';
 import { HostServer, DisplayInfo, generatePairingCode } from './signaling';
@@ -54,6 +55,7 @@ const discovery = new Discovery();
 let mainWindow: BrowserWindow | null = null;
 let tray: Tray | null = null;
 let isQuitting = false;
+let updateReadyVersion: string | null = null;
 const viewerWindows = new Map<string, BrowserWindow>(); // sessionId -> window
 let hostServer: HostServer | null = null;
 let sessionCode = '';
@@ -208,6 +210,32 @@ function permissionStatus() {
 }
 
 // ---------------------------------------------------------------------------
+// Auto-update: every push to GitHub triggers CI that publishes a new release;
+// running apps pick it up here, download in the background, and install on
+// restart (or via the tray's "Restart to update").
+
+function setupAutoUpdater() {
+  if (!app.isPackaged) return;
+  autoUpdater.autoDownload = true;
+  autoUpdater.autoInstallOnAppQuit = true;
+  autoUpdater.on('update-downloaded', (info) => {
+    updateReadyVersion = info.version;
+    refreshTrayMenu();
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('update-ready', info.version);
+    }
+  });
+  autoUpdater.on('error', (err) => {
+    // Unsigned macOS builds can't auto-install; log and carry on.
+    console.error('auto-update:', err?.message || err);
+  });
+
+  const check = () => autoUpdater.checkForUpdates().catch(() => { /* offline */ });
+  setTimeout(check, 15_000);            // shortly after launch
+  setInterval(check, 15 * 60 * 1000);   // then every 15 minutes
+}
+
+// ---------------------------------------------------------------------------
 // Login item + tray
 
 function applyLoginItemSettings() {
@@ -255,6 +283,13 @@ function refreshTrayMenu() {
         refreshTrayMenu();
       },
     },
+    ...(updateReadyVersion ? [
+      { type: 'separator' as const },
+      {
+        label: `Restart to update (v${updateReadyVersion})`,
+        click: () => { isQuitting = true; autoUpdater.quitAndInstall(); },
+      },
+    ] : []),
     { type: 'separator' },
     { label: 'Quit Warp', click: () => { isQuitting = true; app.quit(); } },
   ]));
@@ -493,6 +528,7 @@ app.whenReady().then(async () => {
   createMainWindow(!startHidden);
   createTray();
   applyLoginItemSettings();
+  setupAutoUpdater();
 
   screen.on('display-added', () => pushHostState());
   screen.on('display-removed', () => pushHostState());

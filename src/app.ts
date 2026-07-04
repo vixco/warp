@@ -139,6 +139,8 @@ document.querySelectorAll<HTMLElement>('[data-perm]').forEach((btn) => {
 
 warp.onHostState(renderHostState);
 warp.onHostingStopped(() => hostEngine.stopAll());
+warp.onUpdateReady((version) =>
+  toast(`Update v${version} downloaded — restart Warp (tray menu) to apply`));
 
 // ---------------------------------------------------------------------------
 // Host streaming engine (runs while hosting; one PeerConnection per session)

@@ -18,6 +18,7 @@
     "dist": "npm run build && electron-builder --mac --win"
   },
   "dependencies": {
+    "electron-updater": "^6.8.9",
     "ws": "^8.18.0"
   },
   "devDependencies": {
@@ -33,6 +34,14 @@
     "directories": {
       "output": "release"
     },
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "vixco",
+        "repo": "warp",
+        "releaseType": "release"
+      }
+    ],
     "files": [
       "dist/**/*",
       "!dist/win-unpacked",

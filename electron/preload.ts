@@ -13,6 +13,8 @@ contextBridge.exposeInMainWorld('warp', {
     ipcRenderer.on('host-state', (_e, s) => fn(s)),
   onHostingStopped: (fn: () => void) =>
     ipcRenderer.on('hosting-stopped', () => fn()),
+  onUpdateReady: (fn: (version: string) => void) =>
+    ipcRenderer.on('update-ready', (_e, v) => fn(v)),
 
   // host engine plumbing
   onEngineMessage: (fn: (data: { sessionId: string; msg: any }) => void) =>

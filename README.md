@@ -115,6 +115,23 @@ electron-builder).
 - Input events carry normalized display-relative coordinates; the host maps
   them through `CGDisplayBounds`, so multi-display pointer routing is exact.
 
+## Auto-updates
+
+Every push to the repo triggers GitHub Actions (`.github/workflows/release.yml`),
+which builds the macOS and Windows installers and publishes them as a GitHub
+release versioned `0.1.<run>`. Installed apps check the release feed 15 seconds
+after launch and every 15 minutes, download updates in the background, and
+apply them on restart (tray menu → *Restart to update*, or automatically on
+the next quit).
+
+Notes:
+
+- The GitHub repo must be **public** for clients to reach the update feed
+  (private repos would require shipping a GitHub token with the app).
+- Windows auto-update works with unsigned builds. macOS **requires a code
+  signing certificate** for auto-install; unsigned Mac builds log the update
+  and keep running — install the new dmg manually or add signing later.
+
 ## Current limitations
 
 - Hosting is macOS-only (Windows/Linux hosting not yet implemented).
