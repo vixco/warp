@@ -47,8 +47,10 @@
       "!dist/win-unpacked",
       "!dist/mac*",
       "assets/**/*",
-      "package.json"
+      "package.json",
+      "scripts/adhoc-sign.cjs"
     ],
+    "afterPack": "scripts/adhoc-sign.cjs",
     "mac": {
       "extraResources": [
         {

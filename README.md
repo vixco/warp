@@ -132,6 +132,22 @@ Notes:
   signing certificate** for auto-install; unsigned Mac builds log the update
   and keep running — install the new dmg manually or add signing later.
 
+### Opening the macOS dmg (no Apple Developer ID)
+
+The CI build has no signing certificate, so it ad-hoc seals the `.app`
+(`scripts/adhoc-sign.cjs`). macOS Gatekeeper still quarantines the download
+because it isn't notarized — on first open you'll see "*Warp* cannot be
+opened because the developer cannot be verified" (or "damaged"). Either:
+
+- **Right-click** Warp.app → *Open* → *Open* in the dialog, **or**
+- strip the quarantine flag once after dragging it to Applications:
+
+  ```sh
+  xattr -dr com.apple.quarantine /Applications/Warp.app
+  ```
+
+A paid Apple Developer ID + notarization would remove this step entirely.
+
 ## Audio passthrough
 
 Warp streams audio in both directions on the first screen's connection, as a
