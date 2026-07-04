@@ -23,6 +23,7 @@ interface Settings {
   hostName: string;
   port: number;
   pairingCode: string;      // persistent code; empty = random per session
+  trustedClients: string[]; // clientIds that paired before and skip the code
   fps: number;
   maxBitrateMbps: number;
   codec: 'h264' | 'vp9' | 'av1';
@@ -42,6 +43,7 @@ function loadSettings(): Settings {
     hostName: os.hostname().replace(/\.local$/, ''),
     port: 9750,
     pairingCode: '',
+    trustedClients: [],
     fps: 60,
     maxBitrateMbps: 150,
     codec: 'h264',
@@ -109,7 +111,20 @@ async function startHosting(): Promise<{ ok: boolean; error?: string }> {
   sessionCode = settings.pairingCode || generatePairingCode();
 
   const server = new HostServer({
-    verifyCode: (code) => code === sessionCode,
+    verifyClient: (code, clientId) => {
+      // Already-paired clients skip the code (they're trusted by deviceId).
+      if (clientId && settings.trustedClients.includes(clientId)) return true;
+      // First-time pairing: accept the correct code, then remember this
+      // client so it never has to enter the code again.
+      if (code && code === sessionCode) {
+        if (clientId && !settings.trustedClients.includes(clientId)) {
+          settings.trustedClients.push(clientId);
+          saveSettings();
+        }
+        return true;
+      }
+      return false;
+    },
     getDisplays,
     createVdisplay: async (width, height, hidpi) => {
       const res = await helpers.createVirtualDisplay(
@@ -445,7 +460,7 @@ function closeAllViewers() {
 }
 
 function openViewerWindow(opts: {
-  sessionId: string; host: string; port: number; code: string;
+  sessionId: string; host: string; port: number; code: string; clientId: string;
   displayId: number; screenIndex: number; targetDisplayId?: number;
   fps: number; bitrateMbps: number; codec: string; mode: string; label: string;
 }) {
@@ -474,6 +489,7 @@ function openViewerWindow(opts: {
     host: opts.host,
     port: String(opts.port),
     code: opts.code,
+    clientId: opts.clientId,
     displayId: String(opts.displayId),
     screenIndex: String(opts.screenIndex),
     fps: String(opts.fps),
@@ -552,7 +568,7 @@ function wireIpc() {
 
   // Viewer window -> open/close/fullscreen helpers
   ipcMain.handle('open-viewers', (_e, args: {
-    host: string; port: number; code: string;
+    host: string; port: number; code: string; clientId: string;
     screens: { displayId: number; targetDisplayId: number; label: string }[];
   }) => {
     args.screens.forEach((s, i) => {
@@ -561,6 +577,7 @@ function wireIpc() {
         host: args.host,
         port: args.port,
         code: args.code,
+        clientId: args.clientId,
         displayId: s.displayId,
         screenIndex: i,
         targetDisplayId: s.targetDisplayId,

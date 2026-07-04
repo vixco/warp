@@ -588,15 +588,45 @@ let cm = {
   pendingVd: new Map<number, (res: any) => void>(),
 };
 
+// Stable per-installation identity so the host can remember this client
+// after the first successful pairing and skip the code on later connects.
+function clientId(): string {
+  let id = localStorage.getItem('warp:clientId');
+  if (!id) {
+    id = Math.random().toString(36).slice(2, 12) + Math.random().toString(36).slice(2, 8);
+    localStorage.setItem('warp:clientId', id);
+  }
+  return id;
+}
+
 function openConnectModal(host: string, port: number, name: string, hostId: string) {
   cm.host = host; cm.port = port; cm.name = name; cm.hostId = hostId;
   $('#cmTitle').textContent = `Connect to ${name}`;
+  $('#connectModal').classList.add('visible');
+
+  if (localStorage.getItem(`paired:${hostId}`) === '1') {
+    // Already paired with this host before — skip the code prompt and
+    // reconnect automatically. The host trusts our clientId.
+    $('#cmStepCode').style.display = 'none';
+    $('#cmStepScreens').style.display = 'none';
+    $('#cmSub').textContent = 'Reconnecting…';
+    runConnect('').catch(() => {
+      // Host no longer trusts this client (e.g. its paired-devices list was
+      // cleared) — fall back to asking for the pairing code again.
+      localStorage.removeItem(`paired:${hostId}`);
+      showCodeStep();
+    });
+    return;
+  }
+  showCodeStep();
+}
+
+function showCodeStep() {
+  $('#cmTitle').textContent = `Connect to ${cm.name}`;
   $('#cmSub').textContent = 'Enter the pairing code shown on the host.';
   $('#cmStepCode').style.display = 'block';
   $('#cmStepScreens').style.display = 'none';
-  const saved = localStorage.getItem(`code:${hostId}`) || '';
-  ($('#cmCode') as HTMLInputElement).value = saved;
-  $('#connectModal').classList.add('visible');
+  ($('#cmCode') as HTMLInputElement).value = localStorage.getItem(`code:${cm.hostId}`) || '';
   ($('#cmCode') as HTMLInputElement).focus();
 }
 
@@ -611,18 +641,20 @@ $('#cmBackBtn').addEventListener('click', closeConnectModal);
   if (e.key === 'Enter') $('#cmConnectBtn').click();
 });
 
-$('#cmConnectBtn').addEventListener('click', async () => {
-  const code = ($('#cmCode') as HTMLInputElement).value.trim();
-  if (!/^\d{4,8}$/.test(code)) { toast('Enter the numeric pairing code', true); return; }
-
-  ($('#cmConnectBtn') as HTMLButtonElement).disabled = true;
+// Open the WebSocket, send `hello` (with code + clientId), await `welcome`,
+// and advance the modal to the screen-mapping step. Throws on auth failure /
+// connection errors so the caller can decide whether to fall back to the
+// code-entry step.
+async function runConnect(code: string): Promise<void> {
+  const btn = $('#cmConnectBtn') as HTMLButtonElement;
+  btn.disabled = true;
   try {
     const ws = new WebSocket(`ws://${cm.host}:${cm.port}`);
     cm.ws = ws;
     const welcome: any = await new Promise((resolve, reject) => {
       const timer = setTimeout(() => reject(new Error('Connection timed out')), 8000);
       ws.onopen = () => ws.send(JSON.stringify({
-        type: 'hello', code, name: 'warp-client',
+        type: 'hello', code, clientId: clientId(), name: 'warp-client',
       }));
       ws.onmessage = (e) => {
         const msg = JSON.parse(e.data);
@@ -633,7 +665,11 @@ $('#cmConnectBtn').addEventListener('click', async () => {
       ws.onclose = () => { clearTimeout(timer); reject(new Error('Connection closed')); };
     });
 
-    localStorage.setItem(`code:${cm.hostId}`, code);
+    // Remember both the pairing (so we skip the prompt next time) and the
+    // code (as a fallback if the host ever forgets this client).
+    localStorage.setItem(`paired:${cm.hostId}`, '1');
+    if (code) localStorage.setItem(`code:${cm.hostId}`, code);
+
     cm.displays = welcome.displays;
     ws.onclose = () => { toast('Host connection lost', true); };
     ws.onmessage = (e) => {
@@ -651,12 +687,19 @@ $('#cmConnectBtn').addEventListener('click', async () => {
     $('#cmStepCode').style.display = 'none';
     $('#cmStepScreens').style.display = 'block';
     renderMapRows();
-  } catch (err: any) {
-    toast(err.message, true);
+  } catch (err) {
     if (cm.ws) { cm.ws.onclose = null; cm.ws.close(); cm.ws = null; }
+    throw err;
   } finally {
-    ($('#cmConnectBtn') as HTMLButtonElement).disabled = false;
+    btn.disabled = false;
   }
+}
+
+$('#cmConnectBtn').addEventListener('click', async () => {
+  const code = ($('#cmCode') as HTMLInputElement).value.trim();
+  if (!/^\d{4,8}$/.test(code)) { toast('Enter the numeric pairing code', true); return; }
+  try { await runConnect(code); }
+  catch (err: any) { toast(err.message, true); }
 });
 
 const RESOLUTIONS = ['1920x1080', '2560x1440', '3440x1440', '3840x2160'];
@@ -795,7 +838,7 @@ $('#cmStartBtn').addEventListener('click', async () => {
     } satisfies SavedMapping));
 
     const code = localStorage.getItem(`code:${cm.hostId}`) || '';
-    await warp.openViewers({ host: cm.host, port: cm.port, code, screens });
+    await warp.openViewers({ host: cm.host, port: cm.port, code, clientId: clientId(), screens });
     closeConnectModal();
     toast(`Streaming ${screens.length} screen(s) from ${cm.name}`);
   } catch (err: any) {

@@ -17,7 +17,11 @@ export interface DisplayInfo {
 }
 
 export interface HostServerCallbacks {
-  verifyCode(code: string): boolean;
+  // Returns true if the connection should be accepted. A client is accepted
+  // either because its persistent clientId is in the host's trusted list
+  // (already paired before) or because it presented the correct pairing code
+  // (first-time pairing — the host may then remember the clientId).
+  verifyClient(code: string, clientId: string): boolean;
   getDisplays(): DisplayInfo[];
   createVdisplay(width: number, height: number, hidpi: boolean):
     Promise<{ ok: boolean; token?: number; displayId?: number; error?: string }>;
@@ -85,7 +89,7 @@ export class HostServer {
 
       if (!conn.authed) {
         if (msg.type === 'hello') {
-          if (this.cb.verifyCode(String(msg.code ?? ''))) {
+          if (this.cb.verifyClient(String(msg.code ?? ''), String(msg.clientId ?? ''))) {
             conn.authed = true;
             conn.name = String(msg.name || 'client').slice(0, 64);
             clearTimeout(authTimeout);

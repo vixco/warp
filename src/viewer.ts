@@ -8,6 +8,7 @@ const P = {
   host: params.get('host') || '127.0.0.1',
   port: Number(params.get('port')) || 9750,
   code: params.get('code') || '',
+  clientId: params.get('clientId') || '',
   displayId: Number(params.get('displayId')) || 0,
   fps: Number(params.get('fps')) || 60,
   bitrate: Number(params.get('bitrate')) || 150,
@@ -65,7 +66,7 @@ function connect() {
   ws = sock;
 
   sock.onopen = () => {
-    sock.send(JSON.stringify({ type: 'hello', code: P.code, name: 'warp-viewer' }));
+    sock.send(JSON.stringify({ type: 'hello', code: P.code, clientId: P.clientId, name: 'warp-viewer' }));
   };
 
   sock.onmessage = async (e) => {
