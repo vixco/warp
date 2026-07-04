@@ -141,8 +141,40 @@ document.querySelectorAll<HTMLElement>('[data-perm]').forEach((btn) => {
 
 warp.onHostState(renderHostState);
 warp.onHostingStopped(() => hostEngine.stopAll());
-warp.onUpdateReady((version) =>
-  toast(`Update v${version} downloaded — restart Warp (tray menu) to apply`));
+warp.onUpdateReady((version) => {
+  toast(`Update v${version} downloaded — restart Warp to apply`);
+  $('#updStatus').textContent = `v${version} ready`;
+  $('#updRestartBtn').style.display = 'inline-flex';
+});
+
+// ---------------------------------------------------------------------------
+// Updates panel
+
+warp.getAppVersion().then((v) => { $('#updVersion').textContent = `Warp v${v}`; });
+
+$('#updCheckBtn').addEventListener('click', async () => {
+  const btn = $('#updCheckBtn') as HTMLButtonElement;
+  const status = $('#updStatus');
+  btn.disabled = true;
+  status.textContent = 'Checking…';
+  try {
+    const res = await warp.checkForUpdates();
+    if (!res.ok) {
+      status.textContent = res.error || 'Check failed';
+    } else if (res.downloaded) {
+      status.textContent = `v${res.latestVersion} ready`;
+      $('#updRestartBtn').style.display = 'inline-flex';
+    } else if (res.updateAvailable) {
+      status.textContent = `v${res.latestVersion} found — downloading…`;
+    } else {
+      status.textContent = `Up to date (v${res.currentVersion})`;
+    }
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+$('#updRestartBtn').addEventListener('click', () => warp.installUpdate());
 
 // ---------------------------------------------------------------------------
 // Host streaming engine (runs while hosting; one PeerConnection per session)

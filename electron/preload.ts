@@ -15,6 +15,9 @@ contextBridge.exposeInMainWorld('warp', {
     ipcRenderer.on('hosting-stopped', () => fn()),
   onUpdateReady: (fn: (version: string) => void) =>
     ipcRenderer.on('update-ready', (_e, v) => fn(v)),
+  checkForUpdates: () => ipcRenderer.invoke('check-for-updates'),
+  getAppVersion: () => ipcRenderer.invoke('get-app-version'),
+  installUpdate: () => ipcRenderer.invoke('install-update'),
 
   // host engine plumbing
   onEngineMessage: (fn: (data: { sessionId: string; msg: any }) => void) =>

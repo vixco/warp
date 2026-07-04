@@ -252,6 +252,31 @@ function setupAutoUpdater() {
   setInterval(check, 15 * 60 * 1000);   // then every 15 minutes
 }
 
+async function checkForUpdatesNow(): Promise<{
+  ok: boolean; currentVersion: string; latestVersion?: string;
+  updateAvailable?: boolean; downloaded?: boolean; error?: string;
+}> {
+  const currentVersion = app.getVersion();
+  if (!app.isPackaged) {
+    return { ok: false, currentVersion, error: 'Updates only work in the installed app' };
+  }
+  if (updateReadyVersion) {
+    return {
+      ok: true, currentVersion, latestVersion: updateReadyVersion,
+      updateAvailable: true, downloaded: true,
+    };
+  }
+  try {
+    const result = await autoUpdater.checkForUpdates();
+    const latestVersion = result?.updateInfo?.version;
+    const updateAvailable = (result as any)?.isUpdateAvailable
+      ?? (!!latestVersion && latestVersion !== currentVersion);
+    return { ok: true, currentVersion, latestVersion, updateAvailable };
+  } catch (err: any) {
+    return { ok: false, currentVersion, error: err?.message || String(err) };
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Login item + tray
 
@@ -300,6 +325,7 @@ function refreshTrayMenu() {
         refreshTrayMenu();
       },
     },
+    { label: 'Check for updates', click: () => { checkForUpdatesNow(); } },
     ...(updateReadyVersion ? [
       { type: 'separator' as const },
       {
@@ -536,6 +562,12 @@ function wireIpc() {
     }
     setTimeout(() => pushHostState(), 500);
     return { ok: true };
+  });
+
+  ipcMain.handle('check-for-updates', () => checkForUpdatesNow());
+  ipcMain.handle('get-app-version', () => app.getVersion());
+  ipcMain.handle('install-update', () => {
+    if (updateReadyVersion) { isQuitting = true; autoUpdater.quitAndInstall(); }
   });
 
   ipcMain.handle('get-clipboard', () => clipboard.readText());
