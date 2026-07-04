@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self' ws: wss:; media-src 'self' blob:;" />
+  <title>Warp</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+<div class="app">
+  <aside class="sidebar">
+    <div class="logo"><span class="bolt">⚡</span> Warp</div>
+    <nav class="nav">
+      <div class="nav-item active" data-page="computers"><span class="ico">🖥</span> Computers</div>
+      <div class="nav-item" data-page="host"><span class="ico">📡</span> Host</div>
+      <div class="nav-item" data-page="settings"><span class="ico">⚙️</span> Settings</div>
+    </nav>
+    <div class="sidebar-footer">
+      <div><span class="host-dot" id="hostDot"></span><span id="hostStatusText">Hosting off</span></div>
+      <div id="clientCountText" style="margin-top:6px"></div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <!-- ============ COMPUTERS ============ -->
+    <section class="page visible" id="page-computers">
+      <h1>Computers</h1>
+      <div class="subtitle">Computers on your network running Warp appear here automatically.</div>
+      <div class="computers-grid" id="computersGrid"></div>
+      <div class="empty-state" id="computersEmpty">
+        <div class="big">📡</div>
+        <div>No computers found yet.</div>
+        <div style="margin-top:6px;font-size:12.5px">
+          Enable hosting on your other machine, or connect manually below.
+        </div>
+      </div>
+
+      <h2>Manual connection</h2>
+      <div class="panel">
+        <div class="field-row">
+          <div class="field" style="flex:2">
+            <label>Host address</label>
+            <input type="text" id="manualHost" placeholder="192.168.1.50" />
+          </div>
+          <div class="field" style="flex:1">
+            <label>Port</label>
+            <input type="number" id="manualPort" value="9750" />
+          </div>
+          <div class="field" style="flex:none;display:flex;align-items:flex-end">
+            <button class="btn" id="manualConnectBtn">Connect</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ HOST ============ -->
+    <section class="page" id="page-host">
+      <h1>Host</h1>
+      <div class="subtitle">Share this computer's displays with your other devices.</div>
+
+      <div class="panel">
+        <div class="panel-row">
+          <div>
+            <div class="title">Enable hosting</div>
+            <div class="desc">Allow other computers to connect and stream your displays.</div>
+          </div>
+          <label class="switch">
+            <input type="checkbox" id="hostToggle" />
+            <span class="track"></span>
+          </label>
+        </div>
+        <div id="hostOnlyMac" class="hint" style="margin-top:12px;display:none">
+          Hosting is currently supported on macOS. This machine can still connect to hosts as a client.
+        </div>
+      </div>
+
+      <div id="hostInfo" style="display:none">
+        <div class="panel">
+          <div class="panel-row">
+            <div>
+              <div class="title">Pairing code</div>
+              <div class="desc">Enter this code on the connecting computer.</div>
+            </div>
+            <div class="pairing-code" id="pairingCode">——————</div>
+          </div>
+          <div style="margin-top:14px" class="kv">
+            <div class="k">Address</div><div id="hostAddr">—</div>
+            <div class="k">Connected clients</div><div id="hostClients">0</div>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-row" style="margin-bottom:12px">
+            <div class="title">Displays</div>
+            <button class="btn secondary small" id="addVdisplayBtn">+ Virtual display</button>
+          </div>
+          <div class="display-list" id="hostDisplayList"></div>
+          <div class="hint" style="margin-top:10px">
+            Virtual displays let clients stream extra screens that don't physically exist —
+            perfect for closing the MacBook lid and using 3 remote monitors.
+          </div>
+        </div>
+      </div>
+
+      <div class="panel" id="permPanel">
+        <div class="title" style="margin-bottom:12px">macOS permissions</div>
+        <div class="display-list">
+          <div class="display-row">
+            <div class="dlabel">Screen recording</div>
+            <div class="spacer"></div>
+            <span class="tag" id="permScreen">…</span>
+            <button class="btn secondary small" data-perm="screen">Open settings</button>
+          </div>
+          <div class="display-row">
+            <div class="dlabel">Accessibility (input control)</div>
+            <div class="spacer"></div>
+            <span class="tag" id="permAccessibility">…</span>
+            <button class="btn secondary small" data-perm="accessibility">Open settings</button>
+          </div>
+        </div>
+        <div class="hint" style="margin-top:10px">
+          Screen recording is required to stream displays; Accessibility is required so the
+          client's mouse and keyboard control this Mac.
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ SETTINGS ============ -->
+    <section class="page" id="page-settings">
+      <h1>Settings</h1>
+      <div class="subtitle">Streaming quality and host configuration.</div>
+
+      <div class="panel">
+        <div class="title" style="margin-bottom:16px">Streaming</div>
+        <div class="field-row">
+          <div class="field">
+            <label>Frame rate</label>
+            <select id="setFps">
+              <option value="30">30 fps</option>
+              <option value="60" selected>60 fps</option>
+            </select>
+          </div>
+          <div class="field">
+            <label>Max bitrate (Mbps per screen)</label>
+            <input type="number" id="setBitrate" min="2" max="200" value="50" />
+          </div>
+          <div class="field">
+            <label>Codec</label>
+            <select id="setCodec">
+              <option value="h264" selected>H.264 (lowest latency)</option>
+              <option value="vp9">VP9</option>
+              <option value="av1">AV1 (best quality)</option>
+            </select>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="title" style="margin-bottom:16px">Host</div>
+        <div class="field-row">
+          <div class="field">
+            <label>Computer name</label>
+            <input type="text" id="setHostName" />
+          </div>
+          <div class="field">
+            <label>Port</label>
+            <input type="number" id="setPort" value="9750" />
+          </div>
+        </div>
+        <div class="field">
+          <label>Fixed pairing code (leave empty for a random code per session)</label>
+          <input type="text" id="setPairingCode" placeholder="e.g. 123456" maxlength="6" />
+        </div>
+        <div class="field" style="display:flex;align-items:center;gap:12px">
+          <label class="switch">
+            <input type="checkbox" id="setHidpi" />
+            <span class="track"></span>
+          </label>
+          <div>
+            <div>Retina (HiDPI) virtual displays</div>
+            <div class="hint">Sharper text, but 4× the pixels to encode.</div>
+          </div>
+        </div>
+        <button class="btn" id="saveSettingsBtn">Save settings</button>
+      </div>
+    </section>
+  </main>
+</div>
+
+<!-- ============ CONNECT MODAL ============ -->
+<div class="modal-backdrop" id="connectModal">
+  <div class="modal">
+    <h3 id="cmTitle">Connect</h3>
+    <div class="sub" id="cmSub">Enter the pairing code shown on the host.</div>
+
+    <div id="cmStepCode">
+      <div class="field">
+        <input type="text" class="code-input" id="cmCode" maxlength="6" placeholder="000000" />
+      </div>
+      <div class="modal-actions">
+        <button class="btn secondary" id="cmCancelBtn">Cancel</button>
+        <button class="btn" id="cmConnectBtn">Connect</button>
+      </div>
+    </div>
+
+    <div id="cmStepScreens" style="display:none">
+      <div class="hint" style="margin-bottom:12px">
+        Map each of your monitors to a display on the host. Choose
+        <b>New virtual display</b> to create an extra screen that matches your
+        monitor's resolution.
+      </div>
+      <div id="cmMapRows"></div>
+      <div class="modal-actions">
+        <button class="btn secondary" id="cmBackBtn">Cancel</button>
+        <button class="btn" id="cmStartBtn">Start streaming</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script type="module" src="app.js"></script>
+</body>
+</html>

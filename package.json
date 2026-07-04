@@ -1,0 +1,69 @@
+{
+  "name": "warp",
+  "productName": "Warp",
+  "version": "0.1.0",
+  "description": "Low-latency remote desktop streaming — host on macOS, play on Windows. Multi-monitor, virtual displays, Parsec-style.",
+  "main": "dist/electron/main.js",
+  "license": "MIT",
+  "author": "Tovix <toshan@tovix.nl>",
+  "scripts": {
+    "build:native": "bash scripts/build-native.sh",
+    "build:ts": "tsc -p tsconfig.main.json && tsc -p tsconfig.renderer.json",
+    "copy:assets": "node scripts/copy-assets.js",
+    "build": "npm run build:ts && npm run copy:assets && npm run build:native",
+    "start": "npm run build && electron .",
+    "dev": "npm run build && electron . --dev",
+    "dist:mac": "npm run build && electron-builder --mac",
+    "dist:win": "npm run build:ts && npm run copy:assets && electron-builder --win --x64",
+    "dist": "npm run build && electron-builder --mac --win"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/ws": "^8.5.13",
+    "electron": "^33.2.0",
+    "electron-builder": "^25.1.8",
+    "typescript": "^5.7.2"
+  },
+  "build": {
+    "appId": "nl.tovix.warp",
+    "productName": "Warp",
+    "files": [
+      "dist/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "native/bin",
+        "to": "native",
+        "filter": [
+          "**/*"
+        ]
+      }
+    ],
+    "mac": {
+      "category": "public.app-category.utilities",
+      "target": [
+        "dmg",
+        "zip"
+      ],
+      "extendInfo": {
+        "NSCameraUsageDescription": "Warp does not use the camera.",
+        "NSMicrophoneUsageDescription": "Warp captures system audio for streaming.",
+        "NSScreenCaptureDescription": "Warp streams your displays to your other devices."
+      }
+    },
+    "win": {
+      "target": [
+        "nsis",
+        "zip"
+      ]
+    },
+    "nsis": {
+      "oneClick": true,
+      "perMachine": false
+    }
+  }
+}
