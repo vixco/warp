@@ -75,6 +75,47 @@
       position: fixed; top: 0; left: 25vw; width: 50vw; height: 14px;
       z-index: 9;
     }
+
+    /* in-stream menu */
+    .menu {
+      position: fixed;
+      top: 50%; left: 50%;
+      transform: translate(-50%, -50%);
+      width: 360px;
+      background: rgba(16, 20, 28, 0.97);
+      border: 1px solid #263042;
+      border-radius: 14px;
+      padding: 22px;
+      color: #e7ecf4;
+      font-family: -apple-system, "Segoe UI", system-ui, sans-serif;
+      font-size: 13.5px;
+      z-index: 20;
+      box-shadow: 0 20px 60px rgba(0,0,0,0.55);
+    }
+    .menu.hidden { display: none; }
+    .menu-title { font-size: 16px; font-weight: 700; margin-bottom: 4px; }
+    .menu-stats { color: #8b96a8; font-size: 12px; margin-bottom: 16px;
+                  font-variant-numeric: tabular-nums; }
+    .menu-row { display: flex; align-items: center; justify-content: space-between;
+                margin-bottom: 10px; }
+    .menu-row label { color: #8b96a8; }
+    .menu-row select {
+      background: #0c1018; color: #e7ecf4;
+      border: 1px solid #263042; border-radius: 7px;
+      font: inherit; padding: 6px 10px; outline: none; min-width: 150px;
+    }
+    .menu-actions { display: flex; gap: 8px; margin-top: 16px; }
+    .menu-actions button {
+      flex: 1;
+      background: #1e2634; color: #e7ecf4;
+      border: 1px solid #263042; border-radius: 8px;
+      font: inherit; font-weight: 600;
+      padding: 8px 0; cursor: pointer;
+    }
+    .menu-actions button:hover { border-color: #4f7cff; }
+    .menu-actions button.danger { background: #b91c1c; border-color: #b91c1c; }
+    .menu-actions button.danger:hover { background: #dc2626; }
+    .menu-hint { color: #566074; font-size: 11px; margin-top: 14px; text-align: center; }
   </style>
 </head>
 <body>
@@ -86,6 +127,41 @@
     <span class="stats" id="ovStats">—</span>
     <button id="ovFullscreen" title="Toggle fullscreen (Ctrl+Shift+F)">⛶</button>
     <button class="disconnect" id="ovDisconnect" title="Disconnect (Ctrl+Shift+Q)">✕</button>
+  </div>
+
+  <!-- in-stream menu (Ctrl+Shift+M) -->
+  <div class="menu hidden" id="menu">
+    <div class="menu-title">⚡ <span id="menuLabel">Warp</span></div>
+    <div class="menu-stats" id="menuStats">—</div>
+    <div class="menu-row">
+      <label>Max bitrate</label>
+      <select id="menuBitrate">
+        <option value="25">25 Mbps</option>
+        <option value="50">50 Mbps</option>
+        <option value="100">100 Mbps</option>
+        <option value="200">200 Mbps</option>
+      </select>
+    </div>
+    <div class="menu-row">
+      <label>Frame rate</label>
+      <select id="menuFps">
+        <option value="30">30 fps</option>
+        <option value="60">60 fps</option>
+      </select>
+    </div>
+    <div class="menu-row">
+      <label>Picture</label>
+      <select id="menuMode">
+        <option value="sharp">Sharp text</option>
+        <option value="smooth">Smooth motion</option>
+      </select>
+    </div>
+    <div class="menu-actions">
+      <button id="menuFullscreen">⛶ Fullscreen</button>
+      <button id="menuResume">Resume</button>
+      <button id="menuDisconnect" class="danger">Disconnect</button>
+    </div>
+    <div class="menu-hint">Ctrl+Shift+M menu · Ctrl+Shift+F fullscreen · Ctrl+Shift+Q disconnect</div>
   </div>
 
   <div class="status" id="status">

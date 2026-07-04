@@ -22,6 +22,7 @@ interface Settings {
   hidpiVirtual: boolean;
   hostingEnabled: boolean;
   launchAtLogin: boolean;
+  streamMode: 'sharp' | 'smooth';
 }
 
 const settingsFile = () => path.join(app.getPath('userData'), 'settings.json');
@@ -32,11 +33,12 @@ function loadSettings(): Settings {
     port: 9750,
     pairingCode: '',
     fps: 60,
-    maxBitrateMbps: 50,
+    maxBitrateMbps: 100,
     codec: 'h264',
     hidpiVirtual: false,
     hostingEnabled: false,
     launchAtLogin: true,
+    streamMode: 'sharp',
   };
   try {
     return { ...defaults, ...JSON.parse(fs.readFileSync(settingsFile(), 'utf8')) };
@@ -124,7 +126,22 @@ async function startHosting(): Promise<{ ok: boolean; error?: string }> {
         sessionId, msg: { type: 'stop-screen', sessionId },
       });
     },
-    onClientsChanged: () => pushHostState(),
+    onClientsChanged: (count) => {
+      pushHostState();
+      // When the last client leaves, tear down the virtual displays it
+      // created (after a short grace period for reconnects).
+      if (count === 0 && vdisplayTokens.size > 0) {
+        setTimeout(async () => {
+          if (hostServer?.clientCount === 0) {
+            for (const [dispId, token] of [...vdisplayTokens]) {
+              await helpers.destroyVirtualDisplay(token);
+              vdisplayTokens.delete(dispId);
+            }
+            pushHostState();
+          }
+        }, 5000);
+      }
+    },
     hostName: () => settings.hostName,
   });
 
@@ -315,6 +332,7 @@ function createMainWindow(show = true) {
     minHeight: 560,
     title: 'Warp',
     show,
+    autoHideMenuBar: true,
     backgroundColor: '#10141c',
     titleBarStyle: process.platform === 'darwin' ? 'hiddenInset' : 'default',
     webPreferences: {
@@ -336,10 +354,21 @@ function createMainWindow(show = true) {
   mainWindow.on('closed', () => { mainWindow = null; });
 }
 
+let closingAllViewers = false;
+function closeAllViewers() {
+  if (closingAllViewers) return;
+  closingAllViewers = true;
+  for (const win of [...viewerWindows.values()]) {
+    if (!win.isDestroyed()) win.close();
+  }
+  viewerWindows.clear();
+  closingAllViewers = false;
+}
+
 function openViewerWindow(opts: {
   sessionId: string; host: string; port: number; code: string;
   displayId: number; screenIndex: number; targetDisplayId?: number;
-  fps: number; bitrateMbps: number; codec: string; label: string;
+  fps: number; bitrateMbps: number; codec: string; mode: string; label: string;
 }) {
   const target = screen.getAllDisplays().find((d) => d.id === opts.targetDisplayId)
     ?? screen.getPrimaryDisplay();
@@ -350,6 +379,7 @@ function openViewerWindow(opts: {
     width: target.bounds.width,
     height: target.bounds.height,
     fullscreen: true,
+    autoHideMenuBar: true,
     backgroundColor: '#000000',
     title: `Warp — ${opts.label}`,
     webPreferences: {
@@ -359,6 +389,7 @@ function openViewerWindow(opts: {
       backgroundThrottling: false,
     },
   });
+  win.removeMenu();
   const params = new URLSearchParams({
     sessionId: opts.sessionId,
     host: opts.host,
@@ -369,11 +400,16 @@ function openViewerWindow(opts: {
     fps: String(opts.fps),
     bitrate: String(opts.bitrateMbps),
     codec: opts.codec,
+    mode: opts.mode,
     label: opts.label,
   });
   win.loadFile(path.join(RENDERER, 'viewer.html'), { search: params.toString() });
   viewerWindows.set(opts.sessionId, win);
-  win.on('closed', () => { viewerWindows.delete(opts.sessionId); });
+  // One screen closing ends the session for all screens (Parsec-style).
+  win.on('closed', () => {
+    viewerWindows.delete(opts.sessionId);
+    closeAllViewers();
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -452,6 +488,7 @@ function wireIpc() {
         fps: settings.fps,
         bitrateMbps: settings.maxBitrateMbps,
         codec: settings.codec,
+        mode: settings.streamMode,
         label: s.label,
       });
     });
@@ -461,9 +498,7 @@ function wireIpc() {
   ipcMain.on('viewer-close', (e) => {
     BrowserWindow.fromWebContents(e.sender)?.close();
   });
-  ipcMain.on('viewer-close-all', () => {
-    for (const win of viewerWindows.values()) win.close();
-  });
+  ipcMain.on('viewer-close-all', () => closeAllViewers());
   ipcMain.on('viewer-toggle-fullscreen', (e) => {
     const win = BrowserWindow.fromWebContents(e.sender);
     if (win) win.setFullScreen(!win.isFullScreen());
@@ -515,6 +550,8 @@ function wireIpc() {
 // ---------------------------------------------------------------------------
 
 app.whenReady().then(async () => {
+  // No File/Edit/View menu bar on Windows/Linux (Parsec-style chrome-less UI).
+  if (process.platform !== 'darwin') Menu.setApplicationMenu(null);
   wireIpc();
   discovery.start();
   discovery.onHostsChanged = (hosts: DiscoveredHost[]) => {

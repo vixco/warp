@@ -38,6 +38,7 @@ async function loadSettingsUi() {
   ($('#setFps') as HTMLSelectElement).value = String(settings.fps);
   ($('#setBitrate') as HTMLInputElement).value = String(settings.maxBitrateMbps);
   ($('#setCodec') as HTMLSelectElement).value = settings.codec;
+  ($('#setStreamMode') as HTMLSelectElement).value = settings.streamMode || 'sharp';
   ($('#setHostName') as HTMLInputElement).value = settings.hostName;
   ($('#setPort') as HTMLInputElement).value = String(settings.port);
   ($('#setPairingCode') as HTMLInputElement).value = settings.pairingCode;
@@ -50,6 +51,7 @@ $('#saveSettingsBtn').addEventListener('click', async () => {
     fps: Number(($('#setFps') as HTMLSelectElement).value),
     maxBitrateMbps: Number(($('#setBitrate') as HTMLInputElement).value),
     codec: ($('#setCodec') as HTMLSelectElement).value,
+    streamMode: ($('#setStreamMode') as HTMLSelectElement).value,
     hostName: ($('#setHostName') as HTMLInputElement).value.trim() || settings.hostName,
     port: Number(($('#setPort') as HTMLInputElement).value) || 9750,
     pairingCode: ($('#setPairingCode') as HTMLInputElement).value.replace(/\D/g, ''),
@@ -150,6 +152,8 @@ interface HostSession {
   stream: MediaStream | null;
   channel: RTCDataChannel | null;
   displayId: number;
+  sender: RTCRtpSender | null;
+  track: MediaStreamTrack | null;
 }
 
 class HostEngine {
@@ -226,12 +230,16 @@ class HostEngine {
     }) as MediaStream;
 
     const track = stream.getVideoTracks()[0];
-    track.contentHint = 'motion';
+    // 'detail' preserves text sharpness at high bitrate; 'smooth' favors
+    // fluid motion (gaming/video) — switchable live from the client menu.
+    track.contentHint = msg.mode === 'smooth' ? 'motion' : 'detail';
 
     const pc = new RTCPeerConnection({
       iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
     });
-    const session: HostSession = { pc, stream, channel: null, displayId };
+    const session: HostSession = {
+      pc, stream, channel: null, displayId, sender: null, track,
+    };
     this.sessions.set(sessionId, session);
 
     const channel = pc.createDataChannel('warp', { ordered: true });
@@ -242,6 +250,7 @@ class HostEngine {
       direction: 'sendonly',
       streams: [stream],
     });
+    session.sender = transceiver.sender;
     preferCodec(transceiver, String(msg.codec || 'h264'));
 
     pc.onicecandidate = (e) => {
@@ -289,11 +298,34 @@ class HostEngine {
       if (msg.t === 'clip') {
         this.lastClip = msg.s;
         warp.setClipboard(msg.s);
+      } else if (msg.t === 'cfg') {
+        this.applyConfig(sessionId, msg);
       } else {
         // Everything else is an input event; displayId is attached client-side
         warp.injectInput(msg);
       }
     } catch { /* ignore */ }
+  }
+
+  // Live quality changes from the client's in-stream menu.
+  private async applyConfig(sessionId: string, cfg: any) {
+    const s = this.sessions.get(sessionId);
+    if (!s) return;
+    try {
+      if (s.track && cfg.mode) {
+        s.track.contentHint = cfg.mode === 'smooth' ? 'motion' : 'detail';
+      }
+      if (s.sender) {
+        const params = s.sender.getParameters();
+        params.encodings = params.encodings?.length ? params.encodings : [{}];
+        if (cfg.bitrate) params.encodings[0].maxBitrate = Number(cfg.bitrate) * 1_000_000;
+        if (cfg.fps) params.encodings[0].maxFramerate = Number(cfg.fps);
+        await s.sender.setParameters(params);
+      }
+      if (s.track && cfg.fps) {
+        await s.track.applyConstraints({ frameRate: { max: Number(cfg.fps) } });
+      }
+    } catch (err) { console.warn('applyConfig failed', err); }
   }
 
   stopScreen(sessionId: string) {
@@ -444,10 +476,28 @@ $('#cmConnectBtn').addEventListener('click', async () => {
   }
 });
 
+const RESOLUTIONS = ['1920x1080', '2560x1440', '3440x1440', '3840x2160'];
+
+interface SavedMapping { monCount: number; slots: { choice: string; res: string }[] }
+
+function loadSavedMapping(): SavedMapping | null {
+  try {
+    const raw = localStorage.getItem(`map:${cm.hostId}`);
+    if (!raw) return null;
+    const m = JSON.parse(raw) as SavedMapping;
+    return m.monCount === cm.localMonitors.length ? m : null;
+  } catch { return null; }
+}
+
 function renderMapRows() {
   const rows = $('#cmMapRows');
-  const previous = [...rows.querySelectorAll('select')].map((s) => (s as HTMLSelectElement).value);
+  const prevChoice = [...rows.querySelectorAll('select.sel-display')]
+    .map((s) => (s as HTMLSelectElement).value);
+  const prevRes = [...rows.querySelectorAll('select.sel-res')]
+    .map((s) => (s as HTMLSelectElement).value);
+  const saved = prevChoice.length ? null : loadSavedMapping();
   rows.innerHTML = '';
+
   cm.localMonitors.forEach((mon, i) => {
     const row = document.createElement('div');
     row.className = 'map-row';
@@ -455,31 +505,47 @@ function renderMapRows() {
     monDiv.className = 'mon';
     monDiv.innerHTML = `Monitor ${i + 1}${mon.primary ? ' ★' : ''}<small></small>`;
     monDiv.querySelector('small')!.textContent = `${mon.width} × ${mon.height}`;
-    const select = document.createElement('select');
-    select.dataset.monIndex = String(i);
 
-    const optNone = new Option('— not used —', 'none');
-    select.add(optNone);
+    const right = document.createElement('div');
+    right.style.display = 'flex';
+    right.style.flexDirection = 'column';
+    right.style.gap = '6px';
+
+    const select = document.createElement('select');
+    select.className = 'sel-display';
+    select.dataset.monIndex = String(i);
+    select.add(new Option('— not used —', 'none'));
     for (const d of cm.displays) {
       const tagBits = [d.primary ? 'primary' : '', d.virtual ? 'virtual' : ''].filter(Boolean).join(', ');
       const label = `${d.label} (${d.width}×${d.height}${tagBits ? ', ' + tagBits : ''})`;
       select.add(new Option(label, String(d.id)));
     }
-    select.add(new Option(`✦ New virtual display (${mon.width}×${mon.height})`, 'new'));
+    select.add(new Option('✦ New virtual display', 'new'));
 
-    // sensible defaults: monitor 1 -> host primary, others -> new virtual
-    if (previous[i]) {
-      select.value = previous[i];
-      if (select.value !== previous[i]) select.value = 'none';
-    } else if (i === 0) {
-      const primary = cm.displays.find((d) => d.primary);
-      select.value = primary ? String(primary.id) : 'new';
-    } else {
-      select.value = 'new';
+    const resSelect = document.createElement('select');
+    resSelect.className = 'sel-res';
+    resSelect.add(new Option(`Auto — match monitor (${mon.width}×${mon.height})`, 'auto'));
+    for (const r of RESOLUTIONS) {
+      resSelect.add(new Option(r.replace('x', ' × '), r));
     }
 
+    // Restore: in-dialog state > saved mapping > default (all virtual, auto).
+    const wantedChoice = prevChoice[i] ?? saved?.slots[i]?.choice ?? 'new';
+    select.value = wantedChoice;
+    if (select.value !== wantedChoice) select.value = 'new'; // stale display id
+    resSelect.value = prevRes[i] ?? saved?.slots[i]?.res ?? 'auto';
+    if (!resSelect.value) resSelect.value = 'auto';
+
+    const syncResVisibility = () => {
+      resSelect.style.display = select.value === 'new' ? 'block' : 'none';
+    };
+    select.addEventListener('change', syncResVisibility);
+    syncResVisibility();
+
+    right.appendChild(select);
+    right.appendChild(resSelect);
     row.appendChild(monDiv);
-    row.appendChild(select);
+    row.appendChild(right);
     rows.appendChild(row);
   });
 }
@@ -499,10 +565,16 @@ function createVdisplayOverWs(width: number, height: number): Promise<any> {
 }
 
 $('#cmStartBtn').addEventListener('click', async () => {
-  const selects = [...$('#cmMapRows').querySelectorAll('select')] as HTMLSelectElement[];
-  const wanted: { monIndex: number; choice: string }[] = selects
-    .map((s) => ({ monIndex: Number(s.dataset.monIndex), choice: s.value }))
-    .filter((w) => w.choice !== 'none');
+  const rows = $('#cmMapRows');
+  const displaySelects = [...rows.querySelectorAll('select.sel-display')] as HTMLSelectElement[];
+  const resSelects = [...rows.querySelectorAll('select.sel-res')] as HTMLSelectElement[];
+
+  const slots = displaySelects.map((s, i) => ({
+    monIndex: Number(s.dataset.monIndex),
+    choice: s.value,
+    res: resSelects[i]?.value || 'auto',
+  }));
+  const wanted = slots.filter((w) => w.choice !== 'none');
 
   if (!wanted.length) { toast('Select at least one screen', true); return; }
   const btn = $('#cmStartBtn') as HTMLButtonElement;
@@ -515,7 +587,12 @@ $('#cmStartBtn').addEventListener('click', async () => {
       const mon = cm.localMonitors[w.monIndex];
       let displayId: number;
       if (w.choice === 'new') {
-        const res = await createVdisplayOverWs(mon.width, mon.height);
+        let width = mon.width, height = mon.height;
+        if (w.res !== 'auto') {
+          const [rw, rh] = w.res.split('x').map(Number);
+          if (rw && rh) { width = rw; height = rh; }
+        }
+        const res = await createVdisplayOverWs(width, height);
         if (!res.ok) throw new Error(res.error || 'Could not create virtual display');
         displayId = res.displayId;
       } else {
@@ -527,6 +604,12 @@ $('#cmStartBtn').addEventListener('click', async () => {
         label: `${cm.name} · screen ${screens.length + 1}`,
       });
     }
+
+    // Remember this setup so the next connect restores it automatically.
+    localStorage.setItem(`map:${cm.hostId}`, JSON.stringify({
+      monCount: cm.localMonitors.length,
+      slots: slots.map(({ choice, res }) => ({ choice, res })),
+    } satisfies SavedMapping));
 
     const code = localStorage.getItem(`code:${cm.hostId}`) || '';
     await warp.openViewers({ host: cm.host, port: cm.port, code, screens });

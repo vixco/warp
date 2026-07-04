@@ -10,8 +10,9 @@ const P = {
   code: params.get('code') || '',
   displayId: Number(params.get('displayId')) || 0,
   fps: Number(params.get('fps')) || 60,
-  bitrate: Number(params.get('bitrate')) || 20,
+  bitrate: Number(params.get('bitrate')) || 50,
   codec: params.get('codec') || 'h264',
+  mode: params.get('mode') || 'sharp',
   label: params.get('label') || 'Warp',
 };
 
@@ -73,6 +74,7 @@ function connect() {
           fps: P.fps,
           bitrate: P.bitrate,
           codec: P.codec,
+          mode: P.mode,
         }));
         break;
 
@@ -177,8 +179,11 @@ function normalizedPos(clientX: number, clientY: number): { x: number; y: number
   return { x: Math.min(1, Math.max(0, x)), y: Math.min(1, Math.max(0, y)) };
 }
 
+let menuOpen = false;
+
 let lastMove = 0;
 window.addEventListener('pointermove', (e) => {
+  if (menuOpen) return;
   const now = performance.now();
   if (now - lastMove < 4) return; // ~250 Hz cap
   lastMove = now;
@@ -187,6 +192,8 @@ window.addEventListener('pointermove', (e) => {
 });
 
 window.addEventListener('pointerdown', (e) => {
+  if (menuOpen) return;
+  if ((e.target as HTMLElement).closest('.overlay, .hotzone')) return;
   e.preventDefault();
   const pos = normalizedPos(e.clientX, e.clientY);
   if (pos) sendInput({ t: 'mm', d: P.displayId, x: pos.x, y: pos.y });
@@ -194,32 +201,42 @@ window.addEventListener('pointerdown', (e) => {
 });
 
 window.addEventListener('pointerup', (e) => {
+  if (menuOpen) return;
+  if ((e.target as HTMLElement).closest('.overlay, .hotzone')) return;
   e.preventDefault();
   sendInput({ t: 'mu', b: e.button === 1 ? 1 : e.button === 2 ? 2 : 0 });
 });
 
 window.addEventListener('wheel', (e) => {
+  if (menuOpen) return;
   e.preventDefault();
   sendInput({ t: 'sc', dx: Math.round(e.deltaX), dy: Math.round(e.deltaY) });
 }, { passive: false });
 
 window.addEventListener('contextmenu', (e) => e.preventDefault());
 
-const LOCAL_HOTKEYS = new Set(['KeyQ', 'KeyF']);
+const LOCAL_HOTKEYS = new Set(['KeyQ', 'KeyF', 'KeyM']);
 
 window.addEventListener('keydown', (e) => {
-  // Local hotkeys: Ctrl+Shift+Q disconnect, Ctrl+Shift+F fullscreen
-  if (e.ctrlKey && e.shiftKey && LOCAL_HOTKEYS.has(e.code)) {
+  // Local hotkeys (Ctrl+Shift or Win/Cmd+Shift): Q disconnect, F fullscreen,
+  // M in-stream menu — Parsec-style.
+  if ((e.ctrlKey || e.metaKey) && e.shiftKey && LOCAL_HOTKEYS.has(e.code)) {
     e.preventDefault();
     if (e.code === 'KeyQ') disconnect();
     if (e.code === 'KeyF') window.warp.viewerToggleFullscreen();
+    if (e.code === 'KeyM') toggleMenu();
     return;
+  }
+  if (menuOpen) {
+    if (e.code === 'Escape') { e.preventDefault(); toggleMenu(false); }
+    return; // don't forward keys while the menu is open
   }
   e.preventDefault();
   sendInput({ t: 'kd', code: e.code, r: e.repeat ? 1 : 0 });
 });
 
 window.addEventListener('keyup', (e) => {
+  if (menuOpen) return;
   e.preventDefault();
   sendInput({ t: 'ku', code: e.code });
 });
@@ -257,10 +274,48 @@ document.getElementById('ovFullscreen')!.addEventListener('click', () =>
   window.warp.viewerToggleFullscreen());
 
 function disconnect() {
+  // Disconnecting one screen ends the whole session: every viewer closes.
   sessionEnded = true;
   cleanup();
-  window.warp.viewerClose();
+  window.warp.viewerCloseAll();
 }
+
+// ---------------------------------------------------------------------------
+// In-stream menu (Ctrl+Shift+M / Win+Shift+M)
+
+const menuEl = document.getElementById('menu')!;
+const menuBitrate = document.getElementById('menuBitrate') as HTMLSelectElement;
+const menuFps = document.getElementById('menuFps') as HTMLSelectElement;
+const menuMode = document.getElementById('menuMode') as HTMLSelectElement;
+document.getElementById('menuLabel')!.textContent = P.label;
+
+menuBitrate.value = [25, 50, 100, 200].includes(P.bitrate) ? String(P.bitrate) : '100';
+menuFps.value = P.fps === 30 ? '30' : '60';
+menuMode.value = P.mode === 'smooth' ? 'smooth' : 'sharp';
+
+function toggleMenu(open = !menuOpen) {
+  menuOpen = open;
+  menuEl.classList.toggle('hidden', !menuOpen);
+  document.body.classList.toggle('show-cursor', menuOpen);
+  if (menuOpen) sendInput({ t: 'reset' }); // release held keys/buttons
+}
+
+function sendCfg() {
+  sendInput({
+    t: 'cfg',
+    bitrate: Number(menuBitrate.value),
+    fps: Number(menuFps.value),
+    mode: menuMode.value,
+  });
+}
+menuBitrate.addEventListener('change', sendCfg);
+menuFps.addEventListener('change', sendCfg);
+menuMode.addEventListener('change', sendCfg);
+
+document.getElementById('menuFullscreen')!.addEventListener('click', () =>
+  window.warp.viewerToggleFullscreen());
+document.getElementById('menuResume')!.addEventListener('click', () => toggleMenu(false));
+document.getElementById('menuDisconnect')!.addEventListener('click', disconnect);
 
 let lastBytes = 0, lastFrames = 0, lastTs = 0;
 setInterval(async () => {
@@ -286,9 +341,11 @@ setInterval(async () => {
         rttMs = Math.round(s.currentRoundTripTime * 1000);
       }
     });
-    ovStats.textContent =
+    const statsText =
       `${w}×${h} · ${fps} fps · ${(kbps / 1000).toFixed(1)} Mbps` +
       (rttMs >= 0 ? ` · ${rttMs} ms` : '');
+    ovStats.textContent = statsText;
+    document.getElementById('menuStats')!.textContent = statsText;
     if (params.has('debug')) {
       console.log(`warp-stats ${JSON.stringify({ w, h, fps, kbps, rttMs })}`);
     }
@@ -298,6 +355,7 @@ setInterval(async () => {
 // Show the local cursor only near the top hotzone (the remote cursor is in
 // the video); hide it elsewhere.
 window.addEventListener('pointermove', (e) => {
+  if (menuOpen) return; // cursor stays visible while the menu is open
   document.body.classList.toggle('show-cursor', e.clientY < 60);
 });
 
