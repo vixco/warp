@@ -13,7 +13,7 @@
     "build": "npm run build:ts && npm run copy:assets && npm run build:native",
     "start": "npm run build && electron .",
     "dev": "npm run build && electron . --dev",
-    "dist:mac": "npm run build && electron-builder --mac",
+    "dist:mac": "npm run build && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --mac",
     "dist:win": "npm run build:ts && npm run copy:assets && electron-builder --win --x64",
     "dist": "npm run build && electron-builder --mac --win"
   },
@@ -62,6 +62,8 @@
         }
       ],
       "category": "public.app-category.utilities",
+      "hardenedRuntime": false,
+      "gatekeeperAssess": false,
       "target": [
         "dmg",
         "zip"

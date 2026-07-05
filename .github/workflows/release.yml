@@ -36,9 +36,53 @@ jobs:
       - run: npm ci
       - run: npm version "$APP_VERSION" --no-git-tag-version
       - run: npm run build
-      - run: npx electron-builder --mac --publish always
+
+      # Import the free self-signed code-signing cert (repo secrets) into a
+      # dedicated keychain and TRUST it for code signing, so electron-builder's
+      # `find-identity -v` discovers it and signs every build with the same
+      # identity. That consistent signature is what lets Squirrel.Mac apply
+      # auto-updates on macOS with no Apple Developer ID — the update's cert
+      # matches the running app's designated requirement (leaf-hash based, so
+      # clients need no trust in the cert). Skipped automatically if the
+      # secrets aren't set (falls back to the ad-hoc seal).
+      - name: Set up self-signed signing keychain
+        id: signing
+        if: ${{ secrets.MAC_CSC_LINK != '' }}
+        env:
+          MAC_CSC_LINK: ${{ secrets.MAC_CSC_LINK }}
+          MAC_CSC_KEY_PASSWORD: ${{ secrets.MAC_CSC_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          KC="$RUNNER_TEMP/warp-signing.keychain-db"
+          KCPASS="$(openssl rand -base64 16)"
+          security create-keychain -p "$KCPASS" "$KC"
+          security set-keychain-settings -lut 21600 "$KC"
+          security unlock-keychain -p "$KCPASS" "$KC"
+          echo "$MAC_CSC_LINK" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KC" -P "$MAC_CSC_KEY_PASSWORD" \
+            -T /usr/bin/codesign -T /usr/bin/security
+          # Extract the public cert and trust it for code signing in this keychain.
+          openssl pkcs12 -in "$RUNNER_TEMP/cert.p12" -passin "pass:$MAC_CSC_KEY_PASSWORD" \
+            -clcerts -nokeys -legacy -out "$RUNNER_TEMP/cert.pem" 2>/dev/null || \
+          openssl pkcs12 -in "$RUNNER_TEMP/cert.p12" -passin "pass:$MAC_CSC_KEY_PASSWORD" \
+            -clcerts -nokeys -out "$RUNNER_TEMP/cert.pem"
+          security add-trusted-cert -r trustRoot -p codeSign -k "$KC" "$RUNNER_TEMP/cert.pem"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KCPASS" "$KC" >/dev/null
+          # Prepend our keychain to the search list so codesign/find-identity see it.
+          security list-keychains -d user -s "$KC" $(security list-keychains -d user | sed s/\"//g)
+          security find-identity -v -p codesigning "$KC"
+          rm -f "$RUNNER_TEMP/cert.p12" "$RUNNER_TEMP/cert.pem"
+          echo "keychain=$KC" >> "$GITHUB_OUTPUT"
+
+      - name: Build & publish (signed if cert present)
+        run: npx electron-builder --mac --publish always
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # When set, electron-builder auto-discovers the trusted identity in
+          # this keychain and signs; WARP_SIGNED tells the ad-hoc hook to stand
+          # aside. Both are empty when no cert secret is configured.
+          CSC_KEYCHAIN: ${{ steps.signing.outputs.keychain }}
+          WARP_SIGNED: ${{ steps.signing.outputs.keychain != '' && '1' || '' }}
 
   windows:
     runs-on: windows-latest

@@ -166,9 +166,18 @@ Notes:
 
 - The GitHub repo must be **public** for clients to reach the update feed
   (private repos would require shipping a GitHub token with the app).
-- Windows auto-update works with unsigned builds. macOS **requires a code
-  signing certificate** for auto-install; unsigned Mac builds log the update
-  and keep running — install the new dmg manually or add signing later.
+- Windows auto-update works with unsigned builds.
+- macOS auto-update works with a **free self-signed certificate** (no Apple
+  Developer ID). Run `bash scripts/gen-signing-cert.sh` once, then add the two
+  printed values as repo secrets `MAC_CSC_LINK` and `MAC_CSC_KEY_PASSWORD`. CI
+  signs every build with that cert; Squirrel.Mac accepts updates because each
+  update's signature matches the running app's designated requirement (leaf
+  cert hash — clients need no trust in the cert). Because the current ad-hoc
+  build has a different signature, the **first** self-signed build must be
+  installed manually once; every update after that is automatic.
+- The first-download Gatekeeper quarantine ("Warp is damaged") is the only
+  thing that still needs a paid Developer ID + notarization; it is unrelated to
+  updating (clear it once with `xattr -cr ~/Downloads/Warp-*-arm64.dmg`).
 
 ### Opening the macOS dmg (no Apple Developer ID)
 

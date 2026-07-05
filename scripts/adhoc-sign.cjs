@@ -28,7 +28,10 @@ const path = require('path');
 
 exports.default = async function adhocSign(context) {
   if (context.electronPlatformName !== 'darwin') return;
-  if (process.env.CSC_LINK || process.env.CSC_KEY_PASSWORD) return;
+  // A real certificate is configured (self-signed in CI, or a Developer ID):
+  // let electron-builder do the signing so we don't clobber a valid signature
+  // that Squirrel.Mac auto-update depends on.
+  if (process.env.CSC_LINK || process.env.CSC_KEY_PASSWORD || process.env.WARP_SIGNED) return;
 
   let app = context.appOutDir;
   if (!app.endsWith('.app')) {
