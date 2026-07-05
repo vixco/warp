@@ -63,13 +63,17 @@ static void postMouse(CGEventType type, CGMouseButton button) {
     CFRelease(ev);
 }
 
-static void handleMove(NSDictionary *m) {
-    CGDirectDisplayID displayId = [m[@"d"] unsignedIntValue];
-    double nx = [m[@"x"] doubleValue], ny = [m[@"y"] doubleValue];
+// Map a normalized position (0..1, may run outside that range when a drag
+// crosses a monitor border) within a display to a global desktop point.
+static void setPosFromNorm(CGDirectDisplayID displayId, double nx, double ny) {
     CGRect bounds = CGDisplayBounds(displayId);
     if (CGRectIsEmpty(bounds)) bounds = CGDisplayBounds(CGMainDisplayID());
     gPos.x = bounds.origin.x + nx * bounds.size.width;
     gPos.y = bounds.origin.y + ny * bounds.size.height;
+}
+
+static void handleMove(NSDictionary *m) {
+    setPosFromNorm([m[@"d"] unsignedIntValue], [m[@"x"] doubleValue], [m[@"y"] doubleValue]);
 
     CGEventType type = kCGEventMouseMoved;
     CGMouseButton btn = kCGMouseButtonLeft;
@@ -82,6 +86,12 @@ static void handleMove(NSDictionary *m) {
 static void handleButton(NSDictionary *m, BOOL down) {
     int b = [m[@"b"] intValue];
     if (b < 0 || b > 2) return;
+    // The client carries the pointer position on the button event so the
+    // press/release lands exactly where it happened, atomically — no dependence
+    // on a separate move message arriving first (or at all).
+    if (m[@"x"] != nil && m[@"y"] != nil) {
+        setPosFromNorm([m[@"d"] unsignedIntValue], [m[@"x"] doubleValue], [m[@"y"] doubleValue]);
+    }
     gButtonDown[b] = down;
 
     if (down) {

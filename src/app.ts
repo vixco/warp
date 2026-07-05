@@ -613,6 +613,13 @@ function tuneVideoSdp(sdp: string, maxMbps: number): string {
   let inVideo = false;
   for (const l of lines) {
     if (l.startsWith('m=')) inVideo = l.startsWith('m=video');
+    // Never negotiate the color-space RTP header extension: when present it can
+    // knock Chromium's receiver off hardware decode onto the software FFmpeg
+    // decoder (documented on NVIDIA), which is the classic cause of janky,
+    // lagging animation at high resolution. We stream SDR desktops, so the HDR
+    // color metadata it carries buys nothing — dropping it keeps decode on the
+    // GPU (D3D11VA/NVDEC).
+    if (inVideo && l.includes('rtp-hdrext/color-space')) continue;
     out.push(l);
     // Bandwidth lines belong right after the section's c= line (m,c,b,a order).
     if (inVideo && l.startsWith('c=')) {
@@ -633,7 +640,8 @@ function tuneVideoSdp(sdp: string, maxMbps: number): string {
 }
 
 function preferCodec(transceiver: RTCRtpTransceiver, codec: string) {
-  const mime = codec === 'av1' ? 'video/av1' : codec === 'vp9' ? 'video/vp9' : 'video/h264';
+  const mime = codec === 'av1' ? 'video/av1' : codec === 'vp9' ? 'video/vp9'
+    : codec === 'hevc' ? 'video/h265' : 'video/h264';
   try {
     // setCodecPreferences requires a subset of the *receiver* capabilities.
     const caps = RTCRtpReceiver.getCapabilities('video');

@@ -24,6 +24,13 @@ const P = {
 // Audio passthrough rides on the first screen only (one audio path, not three)
 const WANT_AUDIO = P.screenIndex === 0;
 
+// Map of every local monitor being viewed -> the host display shown on it, in
+// screen (DIP) coordinates. Lets a drag that crosses into another monitor drive
+// the host display shown *there*, regardless of the host's physical layout.
+interface ScreenRect { d: number; x: number; y: number; w: number; h: number }
+let screenMap: ScreenRect[] = [];
+try { screenMap = JSON.parse(params.get('screenMap') || '[]'); } catch { /* single-screen */ }
+
 const video = document.getElementById('video') as HTMLVideoElement;
 const statusEl = document.getElementById('status')!;
 const statusMsg = document.getElementById('statusMsg')!;
@@ -344,39 +351,87 @@ function normalizedPos(clientX: number, clientY: number, clamp = true): { x: num
   return { x, y };
 }
 
+// Resolve a global screen point (MouseEvent.screenX/Y, DIP) to the host display
+// + normalized position of whichever viewed monitor it falls on. Used mid-drag:
+// while a mouse button is held the OS keeps delivering moves to the window the
+// press started in, even when the pointer has physically moved onto another
+// monitor — so this window must retarget the host display shown there.
+function hostPosFromScreen(sx: number, sy: number): { d: number; x: number; y: number } | null {
+  for (const m of screenMap) {
+    if (sx >= m.x && sx < m.x + m.w && sy >= m.y && sy < m.y + m.h) {
+      return { d: m.d, x: (sx - m.x) / m.w, y: (sy - m.y) / m.h };
+    }
+  }
+  return null;
+}
+
+// Where a drag's move/release should land on the host: the letterbox-accurate
+// position if the pointer is still over this window's picture, otherwise the
+// host display of whichever monitor the pointer has physically moved onto.
+function dragHostPos(e: PointerEvent): { d: number; x: number; y: number } | null {
+  const local = normalizedPos(e.clientX, e.clientY, false);
+  if (local && local.x >= 0 && local.x <= 1 && local.y >= 0 && local.y <= 1) {
+    return { d: P.displayId, x: local.x, y: local.y };
+  }
+  const gp = hostPosFromScreen(e.screenX, e.screenY);
+  if (gp) return gp;
+  return local ? { d: P.displayId, x: local.x, y: local.y } : null;
+}
+
 let menuOpen = false;
 
 let lastMove = 0;
+let dragging = false; // a mouse button is held — we're dragging, not hovering
 window.addEventListener('pointermove', (e) => {
   if (menuOpen) return;
   const now = performance.now();
   if (now - lastMove < 4) return; // ~250 Hz cap
   lastMove = now;
-  // If dragging (buttons > 0), don't clamp so we can cross monitor borders
-  const pos = normalizedPos(e.clientX, e.clientY, e.buttons === 0);
-  if (pos) sendFast({ t: 'mm', d: P.displayId, x: pos.x, y: pos.y });
+  if (!dragging) {
+    // Free hover: unreliable/unordered — the newest position supersedes any
+    // dropped one, so movement never head-of-line-blocks.
+    const pos = normalizedPos(e.clientX, e.clientY, true);
+    if (pos) sendFast({ t: 'mm', d: P.displayId, x: pos.x, y: pos.y });
+    return;
+  }
+  // Dragging: reliable + ordered, on the same channel as the button events, so
+  // a dropped or reordered move can't stall the window or drop it at the wrong
+  // spot mid-drag (the "stroef / werkt soms niet" cross-monitor drag). The
+  // resolver retargets the correct host display once the pointer crosses onto
+  // another monitor.
+  const hp = dragHostPos(e);
+  if (hp) sendInput({ t: 'mm', ...hp });
 });
 
 window.addEventListener('pointerdown', (e) => {
   if (menuOpen) return;
   if ((e.target as HTMLElement).closest('.overlay, .hotzone')) return;
   e.preventDefault();
-  // Sync the host position before the button event so the click lands exactly
-  // where the pointer is.
+  dragging = true;
+  // Capture the pointer for the whole press so a drag that leaves this window
+  // (heading for another monitor) keeps delivering moves here instead of
+  // stalling at the window edge.
+  try { document.documentElement.setPointerCapture(e.pointerId); } catch { /* unsupported */ }
+  const b = e.button === 1 ? 1 : e.button === 2 ? 2 : 0;
   const pos = normalizedPos(e.clientX, e.clientY, true);
-  if (pos) sendInput({ t: 'mm', d: P.displayId, x: pos.x, y: pos.y });
-  sendInput({ t: 'md', b: e.button === 1 ? 1 : e.button === 2 ? 2 : 0 });
+  // Carry the position inside the button event so it's applied atomically with
+  // the press — the click/drag can't land at a stale spot even if a move is
+  // still in flight.
+  sendInput(pos ? { t: 'md', b, d: P.displayId, x: pos.x, y: pos.y } : { t: 'md', b });
 });
 
 window.addEventListener('pointerup', (e) => {
   if (menuOpen) return;
   if ((e.target as HTMLElement).closest('.overlay, .hotzone')) return;
   e.preventDefault();
-  // Reliably sync the final position before the release so a drag ends exactly
-  // where the pointer is, even if the last unreliable move was dropped.
-  const pos = normalizedPos(e.clientX, e.clientY, true);
-  if (pos) sendInput({ t: 'mm', d: P.displayId, x: pos.x, y: pos.y });
-  sendInput({ t: 'mu', b: e.button === 1 ? 1 : e.button === 2 ? 2 : 0 });
+  try { document.documentElement.releasePointerCapture(e.pointerId); } catch { /* ignore */ }
+  const b = e.button === 1 ? 1 : e.button === 2 ? 2 : 0;
+  // Resolve the release against the monitor the pointer is actually over, so a
+  // drag that ended on another monitor drops the window there — instead of
+  // snapping back to this display's border.
+  const hp = dragHostPos(e);
+  sendInput(hp ? { t: 'mu', b, ...hp } : { t: 'mu', b });
+  dragging = false;
 });
 
 window.addEventListener('wheel', (e) => {
@@ -414,7 +469,7 @@ window.addEventListener('keyup', (e) => {
 });
 
 // Release all keys/buttons on host when this window loses focus.
-window.addEventListener('blur', () => sendInput({ t: 'reset' }));
+window.addEventListener('blur', () => { dragging = false; sendInput({ t: 'reset' }); });
 
 // Capture OS-level keys (Alt+Tab, etc.) where the platform allows it.
 async function lockKeyboard() {
@@ -476,7 +531,40 @@ if (![...menuFps.options].some((o) => o.value === String(P.fps))) {
 }
 menuFps.value = String(P.fps);
 menuMode.value = P.mode === 'smooth' ? 'smooth' : 'sharp';
-menuCodec.value = ['h264', 'vp9', 'av1'].includes(P.codec) ? P.codec : 'h264';
+
+// Only offer codecs this viewer can actually hardware-decode. HEVC in
+// particular only exists as a WebRTC codec on Chromium ≥136 (Electron ≥36), so
+// the H.265 option is added at runtime rather than hard-coded — no dead menu
+// entry that silently falls back to H.264 when selected.
+const CODEC_MIME: Record<string, string> = {
+  h264: 'video/h264', hevc: 'video/h265', vp9: 'video/vp9', av1: 'video/av1',
+};
+function decodableCodecs(): Set<string> {
+  const set = new Set<string>(['h264']); // always available
+  try {
+    const mimes = new Set(
+      (RTCRtpReceiver.getCapabilities('video')?.codecs || [])
+        .map((c) => c.mimeType.toLowerCase()));
+    for (const [key, mime] of Object.entries(CODEC_MIME)) {
+      if (mimes.has(mime)) set.add(key);
+    }
+  } catch { /* keep h264-only */ }
+  return set;
+}
+(function syncCodecMenu() {
+  const available = decodableCodecs();
+  // Insert HEVC (right after H.264) when supported and not already present.
+  if (available.has('hevc') && !menuCodec.querySelector('option[value="hevc"]')) {
+    const opt = new Option('H.265 / HEVC — sharper per Mbit', 'hevc');
+    menuCodec.add(opt, menuCodec.options[1]); // after H.264
+  }
+  // Drop any option the viewer can't decode, so selecting it can't dead-end.
+  for (const o of [...menuCodec.options]) {
+    if (!available.has(o.value)) o.remove();
+  }
+  const allowed = [...menuCodec.options].map((o) => o.value);
+  menuCodec.value = allowed.includes(P.codec) ? P.codec : 'h264';
+})();
 menuRes.value = [0, 720, 1080, 1440].includes(P.maxHeight) ? String(P.maxHeight) : '1440';
 
 function toggleMenu(open = !menuOpen) {
@@ -544,6 +632,7 @@ setInterval(async () => {
   try {
     const stats = await pc.getStats();
     let fps = 0, kbps = 0, rttMs = -1, w = 0, h = 0, audioBytes = 0;
+    let decoder = '', hwDecode = false, jbMs = -1, procMs = -1, dropped = 0;
     stats.forEach((s: any) => {
       if (s.type === 'inbound-rtp' && s.kind === 'audio') {
         audioBytes = s.bytesReceived || 0;
@@ -559,6 +648,23 @@ setInterval(async () => {
         }
         lastTs = now; lastFrames = s.framesDecoded; lastBytes = s.bytesReceived;
         w = s.frameWidth; h = s.frameHeight;
+        // Is the frame being decoded on the GPU (D3D11/NVDEC) or has Chromium
+        // silently fallen back to a software decoder? Software decode of a
+        // HiDPI stream is the classic cause of janky, laggy animation. The
+        // heuristic mirrors Chrome's own: hardware decoders aren't "power
+        // efficient"=false and don't report the software impl names.
+        decoder = s.decoderImplementation || '';
+        hwDecode = s.powerEfficientDecoder === true ||
+          (!!decoder && !/software|libvpx|ffmpeg|openh264|dav1d|unknown/i.test(decoder));
+        // Real added latency on the receive side: jitter buffer + total
+        // processing (decode) delay, averaged per emitted/decoded frame.
+        if (s.jitterBufferEmittedCount > 0) {
+          jbMs = Math.round((s.jitterBufferDelay / s.jitterBufferEmittedCount) * 1000);
+        }
+        if (s.framesDecoded > 0 && s.totalProcessingDelay !== undefined) {
+          procMs = Math.round((s.totalProcessingDelay / s.framesDecoded) * 1000);
+        }
+        dropped = s.framesDropped || 0;
       }
       if (s.type === 'candidate-pair' && s.state === 'succeeded' &&
           s.currentRoundTripTime !== undefined) {
@@ -569,9 +675,16 @@ setInterval(async () => {
       `${w}×${h} · ${fps} fps · ${(kbps / 1000).toFixed(1)} Mbps` +
       (rttMs >= 0 ? ` · ${rttMs} ms` : '');
     ovStats.textContent = statsText;
-    document.getElementById('menuStats')!.textContent = statsText;
+    // The menu shows the diagnostic detail: whether decode is on the GPU and
+    // how much delay the jitter buffer / decode are adding — so a "laggy
+    // animation" report can be pinned to software decode vs network vs encoder.
+    const decoderText = decoder
+      ? ` · ${hwDecode ? 'HW' : '⚠ SW'} decode` + (jbMs >= 0 ? ` · jb ${jbMs}ms` : '')
+      : '';
+    document.getElementById('menuStats')!.textContent = statsText + decoderText;
     if (params.has('debug')) {
-      console.log(`warp-stats ${JSON.stringify({ w, h, fps, kbps, rttMs, audioBytes })}`);
+      console.log(`warp-stats ${JSON.stringify(
+        { w, h, fps, kbps, rttMs, audioBytes, decoder, hwDecode, jbMs, procMs, dropped })}`);
     }
   } catch { /* ignore */ }
 }, 1000);

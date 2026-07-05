@@ -31,13 +31,46 @@ app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
 app.commandLine.appendSwitch('ignore-gpu-blocklist');
 app.commandLine.appendSwitch('enable-zero-copy');
 
-// On a LAN, Chromium hides local IPs behind mDNS (.local) ICE candidates by
-// default. That obfuscation can prevent the direct host-to-host candidate pair
-// from forming, pushing traffic onto a slower reflexive/relayed path and adding
-// latency (and setup delay). Warp only ever streams between machines the user
-// has already paired on their own network, so expose the real local IPs for the
-// shortest, lowest-latency direct route.
-app.commandLine.appendSwitch('disable-features', 'WebRtcHideLocalIpsWithMdns');
+// Chromium honours only ONE --enable-features / --disable-features value, so
+// every feature toggle is collected here and applied once.
+const enableFeatures: string[] = [
+  // H.265/HEVC over WebRTC is default-on from Chromium 136; we run newer, so
+  // these are belt-and-suspenders that guarantee the GPU factories advertise
+  // hardware HEVC encode (VideoToolbox on the Mac host) and decode (D3D11VA on
+  // the Windows/NVIDIA viewer). Harmless where already on. HEVC compresses
+  // ~40% better than H.264 at equal quality, so the same picture costs far less
+  // bitrate — which is the real cure for motion/animation lag (less data to
+  // push the instant the screen changes, so congestion control never spikes).
+  'PlatformHEVCEncoderSupport',
+  'PlatformHEVCDecoderSupport',
+];
+const disableFeatures: string[] = [
+  // On a LAN, Chromium hides local IPs behind mDNS (.local) ICE candidates by
+  // default. That obfuscation can prevent the direct host-to-host candidate
+  // pair from forming, pushing traffic onto a slower reflexive/relayed path and
+  // adding latency (and setup delay). Warp only ever streams between machines
+  // the user has already paired on their own network, so expose the real local
+  // IPs for the shortest, lowest-latency direct route.
+  'WebRtcHideLocalIpsWithMdns',
+];
+
+// Windows is always the *viewer* here (hosting is macOS-only), so viewer-side
+// display-latency tuning is safe to apply process-wide on Windows.
+if (process.platform === 'win32') {
+  // Shallow waitable swap chain (queue depth 1 instead of the default 2):
+  // present the freshest decoded frame ~one frame sooner, with vsync still on —
+  // exactly Parsec's "newest frame wins, no tearing" present policy. No effect
+  // on the already-default zero-copy D3D11 → DirectComposition overlay path.
+  enableFeatures.push('DXGIWaitableSwapChain:DXGIWaitableSwapChainMaxQueuedFrames/1');
+  // The stream is upscaled to fill the monitor (encode height is capped for
+  // latency), which makes NVIDIA's driver insert an AI super-resolution / HDR
+  // pass in the video processor — pure added GPU latency for a desktop that's
+  // already sharp. Skip both passes; plain scaling is lower-latency.
+  disableFeatures.push('NvidiaVpSuperResolution', 'NvidiaVpTrueHDR');
+}
+
+app.commandLine.appendSwitch('enable-features', enableFeatures.join(','));
+app.commandLine.appendSwitch('disable-features', disableFeatures.join(','));
 
 interface Settings {
   hostName: string;
@@ -46,7 +79,7 @@ interface Settings {
   trustedClients: string[]; // clientIds that paired before and skip the code
   fps: number;
   maxBitrateMbps: number;
-  codec: 'h264' | 'vp9' | 'av1';
+  codec: 'h264' | 'hevc' | 'vp9' | 'av1';
   hidpiVirtual: boolean;
   hostingEnabled: boolean;
   launchAtLogin: boolean;
@@ -489,6 +522,7 @@ function openViewerWindow(opts: {
   sessionId: string; host: string; port: number; code: string; clientId: string;
   displayId: number; screenIndex: number; targetDisplayId?: number;
   fps: number; bitrateMbps: number; codec: string; mode: string; label: string;
+  screenMap?: string;
 }) {
   const target = screen.getAllDisplays().find((d) => d.id === opts.targetDisplayId)
     ?? screen.getPrimaryDisplay();
@@ -523,6 +557,7 @@ function openViewerWindow(opts: {
     codec: opts.codec,
     mode: opts.mode,
     label: opts.label,
+    screenMap: opts.screenMap || '[]',
   });
   win.loadFile(path.join(RENDERER, 'viewer.html'), { search: params.toString() });
   viewerWindows.set(opts.sessionId, win);
@@ -602,6 +637,21 @@ function wireIpc() {
     host: string; port: number; code: string; clientId: string;
     screens: { displayId: number; targetDisplayId: number; label: string; fps?: number }[];
   }) => {
+    // Global map of each local monitor's screen-coordinate rect -> the host
+    // display shown on it, in DIP space (matching MouseEvent.screenX/Y). Given
+    // to every viewer so a drag that crosses into another monitor controls the
+    // host display shown *there*, no matter how the host arranges its displays
+    // or how the user mapped them. (Fixes cross-monitor drags "not working"
+    // when the host layout doesn't match the client's.)
+    const screenMap = JSON.stringify(args.screens.map((s) => {
+      const mon = screen.getAllDisplays().find((d) => d.id === s.targetDisplayId)
+        ?? screen.getPrimaryDisplay();
+      return {
+        d: s.displayId,
+        x: mon.bounds.x, y: mon.bounds.y,
+        w: mon.bounds.width, h: mon.bounds.height,
+      };
+    }));
     args.screens.forEach((s, i) => {
       openViewerWindow({
         sessionId: `${machineId()}-${Date.now()}-${i}`,
@@ -619,6 +669,7 @@ function wireIpc() {
         codec: settings.codec,
         mode: settings.streamMode,
         label: s.label,
+        screenMap,
       });
     });
     return true;
