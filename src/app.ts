@@ -284,22 +284,35 @@ class HostEngine {
     }
 
     const fps = Number(msg.fps) || 60;
+    const src = source as any;
     const hostSettings = await warp.getSettings();
     const wantAudio = !!msg.wantAudio;
     const audioSource = hostSettings.audioSource || 'auto';
     const useLoopback = wantAudio && hostSettings.audioEnabled !== false &&
       audioSource === 'auto';
 
-    // Capture the display with the OS cursor suppressed (Parsec-style: the
-    // client renders its own zero-lag cursor, so the host cursor must not be
-    // baked into the frames). getDisplayMedia honors `cursor: 'never'` via
-    // ScreenCaptureKit on modern macOS; the legacy chromeMediaSource path
-    // does not. The main process picks the source for this display via the
-    // displayMediaRequestHandler — we queue the displayId first, and
-    // serialize captures so that single-slot matching is race-free.
+    // Per-display capture, pinned to the display's physical pixel size so
+    // Retina/HiDPI displays stream at full resolution. Each screen names its
+    // own source id explicitly (chromeMediaSourceId) — no shared global slot,
+    // so three concurrent screens never race for the wrong display. The real
+    // OS cursor stays in the frames so the user sees the true macOS pointer
+    // (arrow/beam/resize/hand) moving across every screen.
     let stream: MediaStream;
     try {
-      stream = await captureDisplay(displayId);
+      stream = await (navigator.mediaDevices as any).getUserMedia({
+        audio: false,
+        video: {
+          mandatory: {
+            chromeMediaSource: 'desktop',
+            chromeMediaSourceId: src.id,
+            minWidth: src.width || 640,
+            minHeight: src.height || 480,
+            maxWidth: src.width || 8192,
+            maxHeight: src.height || 8192,
+            maxFrameRate: fps,
+          },
+        },
+      }) as MediaStream;
     } catch (err: any) {
       console.error('display capture failed', err);
       warp.toSession(sessionId, {
@@ -497,23 +510,6 @@ async function findVirtualAudioDevice(): Promise<string | null> {
   } catch { return null; }
 }
 
-// Capture a display via getDisplayMedia with the OS cursor suppressed
-// (Parsec-style local-cursor streaming). Captures are serialized so the
-// main-process displayMediaRequestHandler can match each request to the
-// single queued displayId without races.
-let captureChain: Promise<unknown> = Promise.resolve();
-function captureDisplay(displayId: number): Promise<MediaStream> {
-  const run = captureChain.then(async () => {
-    warp.queueCaptureDisplay(displayId);
-    return await navigator.mediaDevices.getDisplayMedia({
-      video: { cursor: 'never' } as any,
-      audio: false,
-    });
-  });
-  captureChain = run.catch(() => { /* keep the chain alive on failure */ });
-  return run as Promise<MediaStream>;
-}
-
 function preferCodec(transceiver: RTCRtpTransceiver, codec: string) {
   const mime = codec === 'av1' ? 'video/av1' : codec === 'vp9' ? 'video/vp9' : 'video/h264';
   try {
@@ -577,7 +573,7 @@ $('#manualConnectBtn').addEventListener('click', () => {
 // ---------------------------------------------------------------------------
 // Connect modal & screen mapping
 
-interface RemoteDisplay { id: number; label: string; width: number; height: number; primary: boolean; virtual: boolean }
+interface RemoteDisplay { id: number; label: string; width: number; height: number; refreshRate?: number; primary: boolean; virtual: boolean }
 
 let cm = {
   host: '', port: 9750, name: '', hostId: '',
@@ -704,7 +700,21 @@ $('#cmConnectBtn').addEventListener('click', async () => {
 
 const RESOLUTIONS = ['1920x1080', '2560x1440', '3440x1440', '3840x2160'];
 
-interface SavedMapping { monCount: number; slots: { choice: string; res: string }[] }
+// Standard frame rates we offer per monitor. The list shown for a given
+// monitor is capped at its native refresh rate (you can't display more than
+// the panel refreshes), and always includes the exact native rate plus 60 as
+// a safe baseline — so a 165 Hz monitor offers up to 165, a 240 Hz up to 240.
+const FPS_LADDER = [24, 30, 48, 50, 60, 75, 90, 100, 120, 144, 165, 200, 240, 360];
+
+function fpsOptionsFor(refreshRate: number): number[] {
+  const native = Math.round(refreshRate) || 60;
+  const set = new Set(FPS_LADDER.filter((f) => f <= native));
+  set.add(60);       // always a safe baseline
+  set.add(native);   // always offer the panel's exact rate
+  return [...set].sort((a, b) => a - b);
+}
+
+interface SavedMapping { monCount: number; slots: { choice: string; res: string; fps: string }[] }
 
 function loadSavedMapping(): SavedMapping | null {
   try {
@@ -721,16 +731,20 @@ function renderMapRows() {
     .map((s) => (s as HTMLSelectElement).value);
   const prevRes = [...rows.querySelectorAll('select.sel-res')]
     .map((s) => (s as HTMLSelectElement).value);
+  const prevFps = [...rows.querySelectorAll('select.sel-fps')]
+    .map((s) => (s as HTMLSelectElement).value);
   const saved = prevChoice.length ? null : loadSavedMapping();
   rows.innerHTML = '';
 
   cm.localMonitors.forEach((mon, i) => {
+    const refreshRate = Math.round(mon.refreshRate) || 60;
     const row = document.createElement('div');
     row.className = 'map-row';
     const monDiv = document.createElement('div');
     monDiv.className = 'mon';
     monDiv.innerHTML = `Monitor ${i + 1}${mon.primary ? ' ★' : ''}<small></small>`;
-    monDiv.querySelector('small')!.textContent = `${mon.width} × ${mon.height}`;
+    monDiv.querySelector('small')!.textContent =
+      `${mon.width} × ${mon.height} · ${refreshRate} Hz`;
 
     const right = document.createElement('div');
     right.style.display = 'flex';
@@ -743,7 +757,8 @@ function renderMapRows() {
     select.add(new Option('— not used —', 'none'));
     for (const d of cm.displays) {
       const tagBits = [d.primary ? 'primary' : '', d.virtual ? 'virtual' : ''].filter(Boolean).join(', ');
-      const label = `${d.label} (${d.width}×${d.height}${tagBits ? ', ' + tagBits : ''})`;
+      const hz = d.refreshRate ? ` @ ${d.refreshRate}Hz` : '';
+      const label = `${d.label} (${d.width}×${d.height}${hz}${tagBits ? ', ' + tagBits : ''})`;
       select.add(new Option(label, String(d.id)));
     }
     select.add(new Option('✦ New virtual display', 'new'));
@@ -755,12 +770,23 @@ function renderMapRows() {
       resSelect.add(new Option(r.replace('x', ' × '), r));
     }
 
+    // Per-monitor frame rate: options capped at this panel's native refresh
+    // rate, defaulting to it (a 165 Hz monitor streams at 165 fps by default).
+    const fpsSelect = document.createElement('select');
+    fpsSelect.className = 'sel-fps';
+    for (const f of fpsOptionsFor(refreshRate)) {
+      const label = f === refreshRate ? `${f} fps (native)` : `${f} fps`;
+      fpsSelect.add(new Option(label, String(f)));
+    }
+
     // Restore: in-dialog state > saved mapping > default (all virtual, auto).
     const wantedChoice = prevChoice[i] ?? saved?.slots[i]?.choice ?? 'new';
     select.value = wantedChoice;
     if (select.value !== wantedChoice) select.value = 'new'; // stale display id
     resSelect.value = prevRes[i] ?? saved?.slots[i]?.res ?? 'auto';
     if (!resSelect.value) resSelect.value = 'auto';
+    fpsSelect.value = prevFps[i] ?? saved?.slots[i]?.fps ?? String(refreshRate);
+    if (!fpsSelect.value) fpsSelect.value = String(refreshRate);
 
     const syncResVisibility = () => {
       resSelect.style.display = select.value === 'new' ? 'block' : 'none';
@@ -770,17 +796,20 @@ function renderMapRows() {
 
     right.appendChild(select);
     right.appendChild(resSelect);
+    right.appendChild(fpsSelect);
     row.appendChild(monDiv);
     row.appendChild(right);
     rows.appendChild(row);
   });
 }
 
-function createVdisplayOverWs(width: number, height: number): Promise<any> {
+function createVdisplayOverWs(width: number, height: number, hz: number): Promise<any> {
   return new Promise((resolve) => {
     const reqId = cm.reqSeq++;
     cm.pendingVd.set(reqId, resolve);
-    cm.ws!.send(JSON.stringify({ type: 'create-vdisplay', reqId, width, height, hidpi: false }));
+    // hz is the client monitor's target frame rate — the virtual display is
+    // created at that refresh rate so the host can capture it at e.g. 165 fps.
+    cm.ws!.send(JSON.stringify({ type: 'create-vdisplay', reqId, width, height, hz, hidpi: false }));
     setTimeout(() => {
       if (cm.pendingVd.has(reqId)) {
         cm.pendingVd.delete(reqId);
@@ -794,11 +823,13 @@ $('#cmStartBtn').addEventListener('click', async () => {
   const rows = $('#cmMapRows');
   const displaySelects = [...rows.querySelectorAll('select.sel-display')] as HTMLSelectElement[];
   const resSelects = [...rows.querySelectorAll('select.sel-res')] as HTMLSelectElement[];
+  const fpsSelects = [...rows.querySelectorAll('select.sel-fps')] as HTMLSelectElement[];
 
   const slots = displaySelects.map((s, i) => ({
     monIndex: Number(s.dataset.monIndex),
     choice: s.value,
     res: resSelects[i]?.value || 'auto',
+    fps: fpsSelects[i]?.value || '60',
   }));
   const wanted = slots.filter((w) => w.choice !== 'none');
 
@@ -808,9 +839,10 @@ $('#cmStartBtn').addEventListener('click', async () => {
   btn.textContent = 'Preparing…';
 
   try {
-    const screens: { displayId: number; targetDisplayId: number; label: string }[] = [];
+    const screens: { displayId: number; targetDisplayId: number; label: string; fps: number }[] = [];
     for (const w of wanted) {
       const mon = cm.localMonitors[w.monIndex];
+      const fps = Number(w.fps) || Math.round(mon.refreshRate) || 60;
       let displayId: number;
       if (w.choice === 'new') {
         let width = mon.width, height = mon.height;
@@ -818,7 +850,9 @@ $('#cmStartBtn').addEventListener('click', async () => {
           const [rw, rh] = w.res.split('x').map(Number);
           if (rw && rh) { width = rw; height = rh; }
         }
-        const res = await createVdisplayOverWs(width, height);
+        // Create the virtual display at the chosen frame rate so the host can
+        // actually capture it that fast (a 60 Hz display caps capture at 60).
+        const res = await createVdisplayOverWs(width, height, fps);
         if (!res.ok) throw new Error(res.error || 'Could not create virtual display');
         displayId = res.displayId;
       } else {
@@ -828,13 +862,14 @@ $('#cmStartBtn').addEventListener('click', async () => {
         displayId,
         targetDisplayId: mon.id,
         label: `${cm.name} · screen ${screens.length + 1}`,
+        fps,
       });
     }
 
     // Remember this setup so the next connect restores it automatically.
     localStorage.setItem(`map:${cm.hostId}`, JSON.stringify({
       monCount: cm.localMonitors.length,
-      slots: slots.map(({ choice, res }) => ({ choice, res })),
+      slots: slots.map(({ choice, res, fps }) => ({ choice, res, fps })),
     } satisfies SavedMapping));
 
     const code = localStorage.getItem(`code:${cm.hostId}`) || '';

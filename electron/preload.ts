@@ -50,8 +50,8 @@ contextBridge.exposeInMainWorld('warp', {
   requestScreenPermission: () => ipcRenderer.invoke('request-screen-permission'),
 
   // virtual displays (host UI)
-  createVdisplay: (width: number, height: number) =>
-    ipcRenderer.invoke('create-vdisplay-local', width, height),
+  createVdisplay: (width: number, height: number, hz?: number) =>
+    ipcRenderer.invoke('create-vdisplay-local', width, height, hz),
   destroyVdisplay: (token: number) =>
     ipcRenderer.invoke('destroy-vdisplay-local', token),
 

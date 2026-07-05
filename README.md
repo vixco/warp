@@ -8,9 +8,10 @@ remote screen while your MacBook stays closed.
 ## How it works
 
 - **Host (macOS)** captures each display and streams it over WebRTC with
-  hardware H.264 encoding at the display's full physical resolution, 60 fps,
-  up to 200 Mbps per screen, with a zero jitter-buffer receiver for the lowest
-  possible latency.
+  hardware H.264 encoding at the display's full physical resolution, at a
+  **per-monitor frame rate** (60 / 120 / 144 / 165 / 240 Hz — each screen its
+  own), up to 200 Mbps per screen, with a zero jitter-buffer receiver for the
+  lowest possible latency.
 - **Client (Windows/macOS)** opens one fullscreen viewer window per monitor.
   Mouse, keyboard, scroll and clipboard are forwarded to the host over a
   WebRTC data channel.
@@ -66,11 +67,17 @@ electron-builder).
 1. Start Warp on the Windows PC. The Mac appears under **Computers**
    (same network), or connect manually with its IP.
 2. Enter the pairing code.
-3. In the screen mapping dialog every local monitor gets a dropdown:
-   - Monitor 1 → the Mac's built-in/primary display
-   - Monitor 2 → **New virtual display** (created at that monitor's resolution)
-   - Monitor 3 → **New virtual display**
-4. **Start streaming** — each monitor becomes a fullscreen remote screen.
+3. In the screen mapping dialog every local monitor gets dropdowns:
+   - **Which screen**: Monitor 1 → the Mac's built-in/primary display,
+     Monitor 2 → **New virtual display** (created at that monitor's
+     resolution), Monitor 3 → **New virtual display**
+   - **Frame rate**: each monitor picks its own — options are capped at that
+     panel's native refresh rate and default to it, so a 165 Hz monitor
+     streams at 165 fps and a 60 Hz one at 60 fps. New virtual displays are
+     created at the chosen refresh rate so the host can genuinely capture
+     that fast.
+4. **Start streaming** — each monitor becomes a fullscreen remote screen at
+   its own frame rate.
 
 ### Closing the MacBook lid (clamshell)
 
@@ -90,7 +97,10 @@ electron-builder).
 
 ## Settings
 
-- **Frame rate**: 30/60 fps
+- **Default frame rate**: fallback rate (30 / 60 / 90 / 120 / 144 / 165 / 240
+  fps) used when a monitor doesn't pick its own. Per-monitor frame rate is
+  chosen in the connect dialog and can be changed live in the in-stream menu
+  (Ctrl+Shift+M).
 - **Max bitrate**: per-screen encoder cap (default 50 Mbps — raise it on a
   wired LAN for near-lossless quality)
 - **Codec**: H.264 (hardware, lowest latency), VP9, AV1
@@ -111,7 +121,8 @@ electron-builder).
 ```
 
 - One WebRTC peer connection **per screen** — three monitors = three
-  independent 60 fps streams.
+  independent streams, each at its own frame rate (e.g. a 240 Hz gaming
+  monitor and a 60 Hz secondary side by side).
 - Input events carry normalized display-relative coordinates; the host maps
   them through `CGDisplayBounds`, so multi-display pointer routing is exact.
 

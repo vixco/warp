@@ -28,7 +28,7 @@ export interface WarpApi {
   viewerToggleFullscreen(): void;
   openPermissionSettings(which: string): Promise<void>;
   requestScreenPermission(): Promise<any>;
-  createVdisplay(width: number, height: number): Promise<any>;
+  createVdisplay(width: number, height: number, hz?: number): Promise<any>;
   destroyVdisplay(token: number): Promise<any>;
   getClipboard(): Promise<string>;
   setClipboard(text: string): void;

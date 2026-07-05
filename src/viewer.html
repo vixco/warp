@@ -7,22 +7,10 @@
   <title>Warp Viewer</title>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
+    /* The real macOS cursor is captured into the video stream, so the local
+       OS cursor is hidden over the picture — only the overlay/menu reveal it. */
     html, body { height: 100%; background: #000; overflow: hidden; cursor: none; }
     body.show-cursor { cursor: default; }
-
-    /* Parsec-style local cursor: rendered client-side so it tracks the
-       pointer with zero lag (the host cursor is suppressed in the stream).
-       Shaped like the macOS arrow; the SVG tip sits at the element origin so
-       translating it to (clientX, clientY) puts the hotspot under the pointer. */
-    #localCursor {
-      position: fixed; top: 0; left: 0;
-      width: 22px; height: 22px;
-      pointer-events: none; z-index: 50;
-      transform: translate(-100px, -100px);
-      will-change: transform;
-      filter: drop-shadow(0 1px 1px rgba(0,0,0,0.35));
-    }
-    #localCursor.hidden { display: none; }
 
     video {
       width: 100vw; height: 100vh;
@@ -135,13 +123,6 @@
 <body>
   <video id="video" autoplay muted playsinline></video>
 
-  <!-- Local zero-lag cursor (host cursor is suppressed in the stream) -->
-  <svg id="localCursor" class="hidden" viewBox="0 0 22 22" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
-    <path d="M1 1 L1 17 L5.5 13 L8.5 21 L11 20 L8 12 L14 12 Z"
-          fill="#ffffff" stroke="#000000" stroke-width="1.4"
-          stroke-linejoin="round" stroke-linecap="round" />
-  </svg>
-
   <div class="hotzone"></div>
   <div class="overlay" id="overlay">
     <span class="label" id="ovLabel">Warp</span>
@@ -171,6 +152,11 @@
       <select id="menuFps">
         <option value="30">30 fps</option>
         <option value="60">60 fps</option>
+        <option value="90">90 fps</option>
+        <option value="120">120 fps</option>
+        <option value="144">144 fps</option>
+        <option value="165">165 fps</option>
+        <option value="240">240 fps</option>
       </select>
     </div>
     <div class="menu-row">

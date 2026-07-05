@@ -11,6 +11,7 @@ export interface DisplayInfo {
   width: number;
   height: number;
   scaleFactor: number;
+  refreshRate?: number;  // native panel refresh rate in Hz
   primary: boolean;
   virtual: boolean;
   vdisplayToken?: number;
@@ -23,7 +24,7 @@ export interface HostServerCallbacks {
   // (first-time pairing — the host may then remember the clientId).
   verifyClient(code: string, clientId: string): boolean;
   getDisplays(): DisplayInfo[];
-  createVdisplay(width: number, height: number, hidpi: boolean):
+  createVdisplay(width: number, height: number, hidpi: boolean, hz?: number):
     Promise<{ ok: boolean; token?: number; displayId?: number; error?: string }>;
   destroyVdisplay(token: number): Promise<void>;
   // Messages that must reach the host engine renderer (start/stop/rtc)
@@ -114,7 +115,8 @@ export class HostServer {
 
         case 'create-vdisplay': {
           const res = await this.cb.createVdisplay(
-            Number(msg.width) || 1920, Number(msg.height) || 1080, !!msg.hidpi);
+            Number(msg.width) || 1920, Number(msg.height) || 1080, !!msg.hidpi,
+            Number(msg.hz) || 60);
           this.send(ws, { type: 'vdisplay-result', reqId: msg.reqId, ...res });
           // Give macOS a moment to register the new display, then broadcast.
           setTimeout(() => this.broadcastDisplays(), 800);

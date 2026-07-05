@@ -135,11 +135,17 @@
         <div class="title" style="margin-bottom:16px">Streaming</div>
         <div class="field-row">
           <div class="field">
-            <label>Frame rate</label>
+            <label>Default frame rate</label>
             <select id="setFps">
               <option value="30">30 fps</option>
               <option value="60" selected>60 fps</option>
+              <option value="90">90 fps</option>
+              <option value="120">120 fps</option>
+              <option value="144">144 fps</option>
+              <option value="165">165 fps</option>
+              <option value="240">240 fps</option>
             </select>
+            <small class="hint">Fallback rate. Each monitor picks its own in the connect dialog.</small>
           </div>
           <div class="field">
             <label>Max bitrate (Mbps per screen)</label>

@@ -97,6 +97,7 @@ function getDisplays(): DisplayInfo[] {
     width: Math.round(d.size.width * d.scaleFactor),
     height: Math.round(d.size.height * d.scaleFactor),
     scaleFactor: d.scaleFactor,
+    refreshRate: Math.round((d as any).displayFrequency) || 60,
     primary: d.id === primary.id,
     virtual: vdisplayTokens.has(d.id),
     vdisplayToken: vdisplayTokens.get(d.id),
@@ -126,10 +127,10 @@ async function startHosting(): Promise<{ ok: boolean; error?: string }> {
       return false;
     },
     getDisplays,
-    createVdisplay: async (width, height, hidpi) => {
+    createVdisplay: async (width, height, hidpi, hz) => {
       const res = await helpers.createVirtualDisplay(
         width, height, hidpi ?? settings.hidpiVirtual,
-        `Warp Display ${vdisplayTokens.size + 1}`);
+        `Warp Display ${vdisplayTokens.size + 1}`, hz ?? 60);
       if (res.ok && res.displayId !== undefined && res.token !== undefined) {
         vdisplayTokens.set(res.displayId, res.token);
         pushHostState();
@@ -535,6 +536,11 @@ function wireIpc() {
       primary: d.id === screen.getPrimaryDisplay().id,
       width: Math.round(d.size.width * d.scaleFactor),
       height: Math.round(d.size.height * d.scaleFactor),
+      // The monitor's native refresh rate, so the client can offer (and
+      // default to) the frame rates the panel can actually display —
+      // 60 / 120 / 144 / 165 / 240 Hz, per monitor. Falls back to 60 when
+      // the platform doesn't report it.
+      refreshRate: Math.round((d as any).displayFrequency) || 60,
     })));
 
   // Host engine: resolve a capture source id for a given display id
@@ -569,7 +575,7 @@ function wireIpc() {
   // Viewer window -> open/close/fullscreen helpers
   ipcMain.handle('open-viewers', (_e, args: {
     host: string; port: number; code: string; clientId: string;
-    screens: { displayId: number; targetDisplayId: number; label: string }[];
+    screens: { displayId: number; targetDisplayId: number; label: string; fps?: number }[];
   }) => {
     args.screens.forEach((s, i) => {
       openViewerWindow({
@@ -581,7 +587,9 @@ function wireIpc() {
         displayId: s.displayId,
         screenIndex: i,
         targetDisplayId: s.targetDisplayId,
-        fps: settings.fps,
+        // Per-monitor frame rate chosen in the mapping dialog; falls back to
+        // the global default when a screen didn't specify one.
+        fps: s.fps || settings.fps,
         bitrateMbps: settings.maxBitrateMbps,
         codec: settings.codec,
         mode: settings.streamMode,
@@ -615,10 +623,10 @@ function wireIpc() {
   });
 
   // Host UI "+ Virtual display" button
-  ipcMain.handle('create-vdisplay-local', async (_e, width: number, height: number) => {
+  ipcMain.handle('create-vdisplay-local', async (_e, width: number, height: number, hz?: number) => {
     const res = await helpers.createVirtualDisplay(
       width || 1920, height || 1080, settings.hidpiVirtual,
-      `Warp Display ${vdisplayTokens.size + 1}`);
+      `Warp Display ${vdisplayTokens.size + 1}`, hz || 60);
     if (res.ok && res.displayId !== undefined && res.token !== undefined) {
       vdisplayTokens.set(res.displayId, res.token);
       setTimeout(() => pushHostState(), 800);

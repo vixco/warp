@@ -158,10 +158,15 @@ export class NativeHelpers {
     }
   }
 
-  async createVirtualDisplay(width: number, height: number, hidpi: boolean, name: string):
+  async createVirtualDisplay(
+    width: number, height: number, hidpi: boolean, name: string, hz = 60):
       Promise<{ ok: boolean; token?: number; displayId?: number; error?: string }> {
     if (process.platform !== 'darwin') return { ok: false, error: 'macOS only' };
-    return this.vdisplay.request({ cmd: 'create', width, height, hz: 60, hidpi: hidpi ? 1 : 0, name });
+    // The virtual display is created at the requested refresh rate so the
+    // host can capture it at high frame rates (120 / 144 / 165 / 240 Hz).
+    // A display capped at 60 Hz can never be captured faster than 60 fps.
+    const safeHz = Math.min(Math.max(Math.round(hz) || 60, 24), 480);
+    return this.vdisplay.request({ cmd: 'create', width, height, hz: safeHz, hidpi: hidpi ? 1 : 0, name });
   }
 
   async destroyVirtualDisplay(token: number): Promise<{ ok: boolean }> {
