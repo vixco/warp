@@ -45,7 +45,7 @@ function loadSettings(): Settings {
     pairingCode: '',
     trustedClients: [],
     fps: 60,
-    maxBitrateMbps: 150,
+    maxBitrateMbps: 200,   // VBR ceiling — idle stays near-zero, motion gets full quality
     codec: 'h264',
     hidpiVirtual: false,
     hostingEnabled: false,

@@ -170,7 +170,7 @@ async function acceptOffer(sdp: string) {
   if (WANT_AUDIO) await attachMic();
 
   const answer = await pc.createAnswer();
-  answer.sdp = mungeOpus(answer.sdp || '');
+  answer.sdp = tuneAnswerVideo(mungeOpus(answer.sdp || ''), P.bitrate);
   await pc.setLocalDescription(answer);
   ws?.send(JSON.stringify({ type: 'rtc-answer', sessionId: P.sessionId, sdp: answer.sdp }));
 }
@@ -179,6 +179,25 @@ async function acceptOffer(sdp: string) {
 function mungeOpus(sdp: string): string {
   return sdp.replace(/a=fmtp:(\d+) minptime=10;useinbandfec=1/g,
     'a=fmtp:$1 minptime=10;useinbandfec=1;stereo=1;sprop-stereo=1;maxaveragebitrate=256000');
+}
+
+// Advertise a high receive bandwidth on the video m-line of our answer. Without
+// this the receiver's bandwidth estimate can cap the sender well below the
+// requested bitrate, capping quality regardless of what the host offers.
+function tuneAnswerVideo(sdp: string, maxMbps: number): string {
+  const maxKbps = Math.max(1000, Math.round(maxMbps * 1000));
+  const lines = sdp.split(/\r?\n/);
+  const out: string[] = [];
+  let inVideo = false;
+  for (const l of lines) {
+    if (l.startsWith('m=')) inVideo = l.startsWith('m=video');
+    out.push(l);
+    if (inVideo && l.startsWith('c=')) {
+      out.push(`b=AS:${maxKbps}`);
+      out.push(`b=TIAS:${maxKbps * 1000}`);
+    }
+  }
+  return out.join('\r\n');
 }
 
 statusRetry.addEventListener('click', () => connect());

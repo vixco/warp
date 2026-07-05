@@ -101,8 +101,11 @@ electron-builder).
   fps) used when a monitor doesn't pick its own. Per-monitor frame rate is
   chosen in the connect dialog and can be changed live in the in-stream menu
   (Ctrl+Shift+M).
-- **Max bitrate**: per-screen encoder cap (default 50 Mbps — raise it on a
-  wired LAN for near-lossless quality)
+- **Max bitrate**: per-screen VBR *ceiling* (default 200 Mbps). It's a cap,
+  not a target — a still desktop sends almost nothing, and the stream only
+  climbs toward the ceiling when motion or fine detail actually needs it, so
+  quality is maximal while idle bandwidth stays minimal. Lower it only if your
+  link can't sustain the peaks.
 - **Codec**: H.264 (hardware, lowest latency), VP9, AV1
 - **Retina virtual displays**: HiDPI mode (sharper, 4× encode cost)
 - **Fixed pairing code** and host port (default 9750)
@@ -125,6 +128,30 @@ electron-builder).
   monitor and a 60 Hz secondary side by side).
 - Input events carry normalized display-relative coordinates; the host maps
   them through `CGDisplayBounds`, so multi-display pointer routing is exact.
+
+## Latency & quality
+
+Warp is tuned for the "maximum quality, minimal delay, minimal wasted
+bandwidth" corner of the trade-off — the sweet spot on a wired LAN:
+
+- **Wide VBR envelope.** The encoder's bitrate is set with a *low floor* and a
+  *high ceiling* (`x-google-min/start/max-bitrate` written into the offer SDP,
+  reinforced by `setParameters`). A static screen sends almost nothing; the
+  moment something moves it ramps to the full ceiling. You get top quality
+  without paying for it while the picture is still.
+- **Instant sharp image.** A high *start bitrate* (~40 Mbps) means the first
+  frames on connect are already crisp — no multi-second ramp-up that looks
+  blurry and laggy.
+- **Lifted Chromium cap.** WebRTC video is silently limited to ~2 Mbps unless
+  the SDP raises it; Warp raises it so high bitrates actually take effect.
+- **Zero jitter buffer.** The receiver renders frames immediately
+  (`jitterBufferTarget = 0`, `playoutDelayHint = 0`) — no buffering delay,
+  Parsec-style. Audio uses the same zero-buffer path.
+- **Smart degradation.** Under pressure, *Sharp text* mode holds resolution and
+  drops frames (readable text); *Smooth motion* mode holds frame rate and lets
+  resolution soften (fluid gaming). Switchable live in the in-stream menu.
+- **Hardware H.264** (VideoToolbox on the host, D3D/VT on the client) keeps
+  encode/decode latency to a couple of milliseconds.
 
 ## Auto-updates
 

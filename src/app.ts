@@ -397,12 +397,19 @@ class HostEngine {
       }
     };
 
+    const mbps = Number(msg.bitrate) || 150;
+    const mode = msg.mode === 'smooth' ? 'smooth' : 'sharp';
+
     const offer = await pc.createOffer();
-    await pc.setLocalDescription(offer);
-    warp.toSession(sessionId, { type: 'rtc-offer', sdp: offer.sdp });
+    // Tune the encoder's bitrate envelope in the SDP (see tuneVideoSdp): high
+    // ceiling + high start for instant quality, low floor for minimal idle
+    // bandwidth. Must happen before setLocalDescription so the local encoder
+    // picks it up.
+    const tunedSdp = tuneVideoSdp(offer.sdp || '', mbps);
+    await pc.setLocalDescription({ type: 'offer', sdp: tunedSdp });
+    warp.toSession(sessionId, { type: 'rtc-offer', sdp: tunedSdp });
 
     // Apply bitrate/framerate caps once connected.
-    const mbps = Number(msg.bitrate) || 150;
     const sender = transceiver.sender;
     const applyParams = async () => {
       try {
@@ -413,9 +420,7 @@ class HostEngine {
         params.encodings[0].scaleResolutionDownBy = 1; // never downscale
         (params.encodings[0] as any).priority = 'high';
         (params.encodings[0] as any).networkPriority = 'high';
-        // Under constraint, drop frames before dropping resolution (keeps
-        // text sharp, like Parsec's constant-resolution stream).
-        (params as any).degradationPreference = 'maintain-resolution';
+        (params as any).degradationPreference = degradationFor(mode);
         await sender.setParameters(params);
       } catch (err) { console.warn('setParameters failed', err); }
     };
@@ -452,6 +457,8 @@ class HostEngine {
         params.encodings = params.encodings?.length ? params.encodings : [{}];
         if (cfg.bitrate) params.encodings[0].maxBitrate = Number(cfg.bitrate) * 1_000_000;
         if (cfg.fps) params.encodings[0].maxFramerate = Number(cfg.fps);
+        // Keep the sacrifice-order aligned with the live picture-mode switch.
+        if (cfg.mode) (params as any).degradationPreference = degradationFor(cfg.mode);
         await s.sender.setParameters(params);
       }
       if (s.track && cfg.fps) {
@@ -508,6 +515,59 @@ async function findVirtualAudioDevice(): Promise<string | null> {
     if (virtual) console.log(`system audio via virtual device: ${virtual.label}`);
     return virtual?.deviceId ?? null;
   } catch { return null; }
+}
+
+// Under network/CPU constraint, decide what to sacrifice first. Desktop/text
+// ('sharp') holds resolution and drops frames — a crisp-but-choppier picture
+// keeps text readable. Gaming/video ('smooth') holds the frame rate and lets
+// resolution soften — fluid motion matters more than pixel-exactness.
+function degradationFor(mode: string): 'maintain-resolution' | 'maintain-framerate' {
+  return mode === 'smooth' ? 'maintain-framerate' : 'maintain-resolution';
+}
+
+// Widen the video encoder's bitrate envelope directly in the offer SDP. This
+// is the real quality/bandwidth/latency lever:
+//   • Chromium silently caps WebRTC video near ~2 Mbps unless the SDP raises
+//     it — setParameters(maxBitrate) alone is not enough on every path, so we
+//     set b=AS / b=TIAS AND x-google-max-bitrate.
+//   • start-bitrate high → the first frames are already sharp (no multi-second
+//     ramp-up that reads as "blurry / laggy" on connect).
+//   • min-bitrate low → a static desktop sends almost nothing (true VBR), so
+//     bandwidth stays minimal until motion or detail actually needs it.
+// The result: barely any bandwidth on a still screen, up to the full user cap
+// (e.g. 200 Mbps) the instant something moves, with no quality ramp delay.
+function tuneVideoSdp(sdp: string, maxMbps: number): string {
+  const maxKbps = Math.max(1000, Math.round(maxMbps * 1000));
+  const startKbps = Math.min(maxKbps, 40_000); // ~40 Mbps: instant sharp image
+  const minKbps = 500;                          // sip bandwidth when idle (VBR floor)
+
+  const lines = sdp.split(/\r?\n/);
+  const videoPts = new Set<string>();
+  for (const l of lines) {
+    if (l.startsWith('m=video')) l.split(' ').slice(3).forEach((pt) => videoPts.add(pt));
+  }
+
+  const out: string[] = [];
+  let inVideo = false;
+  for (const l of lines) {
+    if (l.startsWith('m=')) inVideo = l.startsWith('m=video');
+    out.push(l);
+    // Bandwidth lines belong right after the section's c= line (m,c,b,a order).
+    if (inVideo && l.startsWith('c=')) {
+      out.push(`b=AS:${maxKbps}`);
+      out.push(`b=TIAS:${maxKbps * 1000}`);
+    }
+    if (inVideo && l.startsWith('a=fmtp:')) {
+      const pt = l.slice('a=fmtp:'.length).split(' ')[0];
+      if (videoPts.has(pt) && !l.includes('x-google-max-bitrate')) {
+        out[out.length - 1] = l +
+          `;x-google-start-bitrate=${startKbps}` +
+          `;x-google-min-bitrate=${minKbps}` +
+          `;x-google-max-bitrate=${maxKbps}`;
+      }
+    }
+  }
+  return out.join('\r\n');
 }
 
 function preferCodec(transceiver: RTCRtpTransceiver, codec: string) {
