@@ -55,36 +55,34 @@ jobs:
         if: ${{ env.MAC_CSC_LINK != '' }}
         run: |
           set -euo pipefail
-          KC="$RUNNER_TEMP/warp-signing.keychain-db"
-          KCPASS="$(openssl rand -base64 16)"
-          security create-keychain -p "$KCPASS" "$KC"
-          security set-keychain-settings -lut 21600 "$KC"
-          security unlock-keychain -p "$KCPASS" "$KC"
           echo "$MAC_CSC_LINK" | base64 --decode > "$RUNNER_TEMP/cert.p12"
-          security import "$RUNNER_TEMP/cert.p12" -k "$KC" -P "$MAC_CSC_KEY_PASSWORD" \
-            -T /usr/bin/codesign -T /usr/bin/security
-          # Extract the public cert and trust it for code signing in this keychain.
+          # Import the cert + private key into the SYSTEM keychain, and trust it
+          # for code signing there — both via sudo, which is passwordless on the
+          # runner and therefore non-interactive. (Trusting into a *user*
+          # keychain triggers a GUI authorization prompt that never resolves on
+          # headless CI, hanging the job — so we deliberately avoid that path.)
+          SYS=/Library/Keychains/System.keychain
+          sudo security import "$RUNNER_TEMP/cert.p12" -k "$SYS" \
+            -P "$MAC_CSC_KEY_PASSWORD" -A -T /usr/bin/codesign
           openssl pkcs12 -in "$RUNNER_TEMP/cert.p12" -passin "pass:$MAC_CSC_KEY_PASSWORD" \
             -clcerts -nokeys -legacy -out "$RUNNER_TEMP/cert.pem" 2>/dev/null || \
           openssl pkcs12 -in "$RUNNER_TEMP/cert.p12" -passin "pass:$MAC_CSC_KEY_PASSWORD" \
             -clcerts -nokeys -out "$RUNNER_TEMP/cert.pem"
-          security add-trusted-cert -r trustRoot -p codeSign -k "$KC" "$RUNNER_TEMP/cert.pem"
-          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KCPASS" "$KC" >/dev/null
-          # Prepend our keychain to the search list so codesign/find-identity see it.
-          security list-keychains -d user -s "$KC" $(security list-keychains -d user | sed s/\"//g)
-          security find-identity -v -p codesigning "$KC"
+          sudo security add-trusted-cert -d -r trustRoot -p codeSign \
+            -k "$SYS" "$RUNNER_TEMP/cert.pem"
           rm -f "$RUNNER_TEMP/cert.p12" "$RUNNER_TEMP/cert.pem"
-          echo "keychain=$KC" >> "$GITHUB_OUTPUT"
+          echo "Discovered code-signing identities:"
+          security find-identity -v -p codesigning
+          echo "signed=1" >> "$GITHUB_OUTPUT"
 
       - name: Build & publish (signed if cert present)
         run: npx electron-builder --mac --publish always
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # When set, electron-builder auto-discovers the trusted identity in
-          # this keychain and signs; WARP_SIGNED tells the ad-hoc hook to stand
+          # With the trusted identity in the system keychain, electron-builder
+          # auto-discovers and signs; WARP_SIGNED tells the ad-hoc hook to stand
           # aside. Both are empty when no cert secret is configured.
-          CSC_KEYCHAIN: ${{ steps.signing.outputs.keychain }}
-          WARP_SIGNED: ${{ steps.signing.outputs.keychain != '' && '1' || '' }}
+          WARP_SIGNED: ${{ steps.signing.outputs.signed }}
 
   windows:
     runs-on: windows-latest
