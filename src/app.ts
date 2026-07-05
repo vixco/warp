@@ -726,7 +726,11 @@ let cm = {
 function clientId(): string {
   let id = localStorage.getItem('warp:clientId');
   if (!id) {
-    id = Math.random().toString(36).slice(2, 12) + Math.random().toString(36).slice(2, 8);
+    // This id is a persistent bearer credential (a trusted client skips the
+    // pairing code), so it must be unguessable — never Math.random.
+    id = crypto.randomUUID?.() ??
+      [...crypto.getRandomValues(new Uint8Array(16))]
+        .map((b) => b.toString(16).padStart(2, '0')).join('');
     localStorage.setItem('warp:clientId', id);
   }
   return id;

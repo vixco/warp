@@ -3,7 +3,18 @@
 // (which runs in the host renderer process).
 
 import { WebSocketServer, WebSocket } from 'ws';
+import type { IncomingMessage } from 'http';
 import * as crypto from 'crypto';
+
+// --- Pairing brute-force guard ---------------------------------------------
+// A wrong pairing code counts as a failed attempt for the connecting address.
+// After MAX_AUTH_FAILS failures that address is locked out for a window that
+// doubles with each further failure (capped), so the 6-digit code space can't
+// be swept over the network. Trusted clients (known clientId) authenticate on
+// the first try and never trip this.
+const MAX_AUTH_FAILS = 5;
+const LOCKOUT_BASE_MS = 30_000;
+const LOCKOUT_MAX_MS = 15 * 60_000;
 
 export interface DisplayInfo {
   id: number;            // CGDirectDisplayID / Electron display id
@@ -46,6 +57,7 @@ export class HostServer {
   private clients = new Set<ClientConn>();
   private sessionOwner = new Map<string, ClientConn>();
   private cb: HostServerCallbacks;
+  private authFails = new Map<string, { count: number; lockedUntil: number }>();
   port = 9750;
 
   constructor(cb: HostServerCallbacks) { this.cb = cb; }
@@ -61,7 +73,7 @@ export class HostServer {
       const wss = new WebSocketServer({ port, host: '0.0.0.0' });
       wss.on('listening', () => { this.wss = wss; resolve(); });
       wss.on('error', (err) => { if (!this.wss) reject(err); else console.error('wss error', err); });
-      wss.on('connection', (ws) => this.onConnection(ws));
+      wss.on('connection', (ws, req) => this.onConnection(ws, req));
     });
   }
 
@@ -78,9 +90,46 @@ export class HostServer {
     if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
   }
 
-  private onConnection(ws: WebSocket) {
+  private isLockedOut(ip: string): boolean {
+    const rec = this.authFails.get(ip);
+    return !!rec && rec.lockedUntil > Date.now();
+  }
+
+  private recordAuthFail(ip: string) {
+    // Opportunistically drop stale entries so a churn of addresses can't grow
+    // the map without bound.
+    if (this.authFails.size > 256) {
+      const now = Date.now();
+      for (const [k, v] of this.authFails) {
+        if (v.lockedUntil < now && v.count < MAX_AUTH_FAILS) this.authFails.delete(k);
+      }
+    }
+    const rec = this.authFails.get(ip) ?? { count: 0, lockedUntil: 0 };
+    rec.count++;
+    if (rec.count >= MAX_AUTH_FAILS) {
+      const over = rec.count - MAX_AUTH_FAILS;
+      rec.lockedUntil = Date.now() + Math.min(LOCKOUT_BASE_MS * 2 ** over, LOCKOUT_MAX_MS);
+    }
+    this.authFails.set(ip, rec);
+  }
+
+  private clearAuthFails(ip: string) {
+    this.authFails.delete(ip);
+  }
+
+  private onConnection(ws: WebSocket, req: IncomingMessage) {
+    const ip = req.socket.remoteAddress || 'unknown';
     const conn: ClientConn = { ws, name: '?', authed: false, sessions: new Set() };
     this.clients.add(conn);
+
+    // Refuse addresses that are currently locked out for too many bad codes,
+    // before any code is even examined.
+    if (this.isLockedOut(ip)) {
+      this.send(ws, { type: 'auth-failed', reason: 'locked' });
+      this.clients.delete(conn);
+      ws.close();
+      return;
+    }
 
     const authTimeout = setTimeout(() => { if (!conn.authed) ws.close(); }, 10000);
 
@@ -93,6 +142,7 @@ export class HostServer {
           if (this.cb.verifyClient(String(msg.code ?? ''), String(msg.clientId ?? ''))) {
             conn.authed = true;
             conn.name = String(msg.name || 'client').slice(0, 64);
+            this.clearAuthFails(ip);
             clearTimeout(authTimeout);
             this.send(ws, {
               type: 'welcome',
@@ -101,6 +151,7 @@ export class HostServer {
             });
             this.cb.onClientsChanged(this.clientCount);
           } else {
+            this.recordAuthFail(ip);
             this.send(ws, { type: 'auth-failed' });
             ws.close();
           }
@@ -185,4 +236,17 @@ export class HostServer {
 
 export function generatePairingCode(): string {
   return String(crypto.randomInt(0, 1000000)).padStart(6, '0');
+}
+
+// Constant-time comparison of the pairing code, so a wrong guess can't be
+// refined character-by-character from how long the check takes.
+export function safeEqualCode(a: string, b: string): boolean {
+  const ab = Buffer.from(String(a));
+  const bb = Buffer.from(String(b));
+  if (ab.length !== bb.length) {
+    // Still run a fixed comparison so timing doesn't reveal the length.
+    crypto.timingSafeEqual(ab, ab);
+    return false;
+  }
+  return crypto.timingSafeEqual(ab, bb);
 }

@@ -21,7 +21,26 @@ remote screen while your MacBook stays closed.
 - **Discovery**: hosts announce themselves over UDP broadcast; they appear
   automatically in the client's *Computers* list. Manual `ip:port` connection
   is also supported.
-- **Pairing**: a 6-digit code (random per session, or fixed in Settings).
+- **Pairing**: a 6-digit code (random per session, or fixed in Settings), with
+  per-address brute-force lockout; a paired client is then remembered and skips
+  the code on later connects.
+
+## Security & threat model
+
+Warp is built for streaming between **machines you own on a trusted local
+network**, Parsec-style — not for hostile or shared networks, and not to be
+exposed directly to the internet.
+
+- Pairing uses a 6-digit code with **per-address brute-force lockout** and a
+  constant-time check; paired clients are remembered by an unguessable (CSPRNG)
+  id so they can skip the code afterwards.
+- The WebRTC media/data path is encrypted (DTLS-SRTP). The signaling handshake
+  currently runs over plaintext WebSocket on the LAN, so **treat your LAN as the
+  trust boundary**. For access across the internet, tunnel over a VPN
+  (WireGuard/Tailscale) rather than forwarding the port.
+
+See [SECURITY.md](SECURITY.md) for the full threat model, what's hardened, known
+limitations, and how to report a vulnerability.
 
 ## Requirements
 
@@ -241,5 +260,13 @@ silent. The client microphone path needs no host-side driver.
 ## Current limitations
 
 - Hosting is macOS-only (Windows/Linux hosting not yet implemented).
-- For connections across the internet, forward TCP port 9750 (signaling);
-  WebRTC uses STUN for the media path.
+- Warp targets a trusted LAN (see
+  [Security & threat model](#security--threat-model)). For access across the
+  internet, tunnel over a VPN (e.g. WireGuard/Tailscale) instead of forwarding
+  port 9750 directly — the signaling channel is not yet TLS-encrypted.
+
+## License
+
+Warp is licensed under the **GNU Lesser General Public License v3.0 or later**
+(`LGPL-3.0-or-later`). See [COPYING.LESSER](COPYING.LESSER) and
+[COPYING](COPYING) for the full text.

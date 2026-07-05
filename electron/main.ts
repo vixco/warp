@@ -5,10 +5,11 @@ import {
 import * as path from 'path';
 import * as fs from 'fs';
 import * as os from 'os';
+import * as crypto from 'crypto';
 import { autoUpdater } from 'electron-updater';
 import { NativeHelpers } from './helpers';
 import { Discovery, DiscoveredHost, primaryLanIp } from './discovery';
-import { HostServer, DisplayInfo, generatePairingCode } from './signaling';
+import { HostServer, DisplayInfo, generatePairingCode, safeEqualCode } from './signaling';
 
 const RENDERER = path.join(__dirname, '..', 'renderer');
 
@@ -141,7 +142,7 @@ async function startHosting(): Promise<{ ok: boolean; error?: string }> {
       if (clientId && settings.trustedClients.includes(clientId)) return true;
       // First-time pairing: accept the correct code, then remember this
       // client so it never has to enter the code again.
-      if (code && code === sessionCode) {
+      if (code && safeEqualCode(code, sessionCode)) {
         if (clientId && !settings.trustedClients.includes(clientId)) {
           settings.trustedClients.push(clientId);
           saveSettings();
@@ -249,7 +250,7 @@ function machineId(): string {
     try {
       cachedMachineId = fs.readFileSync(idFile, 'utf8').trim();
     } catch {
-      cachedMachineId = Math.random().toString(36).slice(2, 12);
+      cachedMachineId = crypto.randomUUID();
       try { fs.writeFileSync(idFile, cachedMachineId); } catch { /* ignore */ }
     }
   }
