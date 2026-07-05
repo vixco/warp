@@ -10,7 +10,7 @@ name: Release
 
 on:
   push:
-    branches: [warp-app, main]
+    branches: [main]
 
 concurrency:
   group: release
