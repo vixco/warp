@@ -293,7 +293,7 @@ function sendInput(ev: object) {
 
 // Map a client-window point to normalized coords on the remote display,
 // accounting for object-fit: contain letterboxing.
-function normalizedPos(clientX: number, clientY: number): { x: number; y: number } | null {
+function normalizedPos(clientX: number, clientY: number, clamp = true): { x: number; y: number } | null {
   const vw = video.videoWidth, vh = video.videoHeight;
   if (!vw || !vh) return null;
   const ew = video.clientWidth, eh = video.clientHeight;
@@ -302,7 +302,10 @@ function normalizedPos(clientX: number, clientY: number): { x: number; y: number
   const ox = (ew - dw) / 2, oy = (eh - dh) / 2;
   const x = (clientX - ox) / dw;
   const y = (clientY - oy) / dh;
-  return { x: Math.min(1, Math.max(0, x)), y: Math.min(1, Math.max(0, y)) };
+  if (clamp) {
+    return { x: Math.min(1, Math.max(0, x)), y: Math.min(1, Math.max(0, y)) };
+  }
+  return { x, y };
 }
 
 let menuOpen = false;
@@ -313,7 +316,8 @@ window.addEventListener('pointermove', (e) => {
   const now = performance.now();
   if (now - lastMove < 4) return; // ~250 Hz cap
   lastMove = now;
-  const pos = normalizedPos(e.clientX, e.clientY);
+  // If dragging (buttons > 0), don't clamp so we can cross monitor borders
+  const pos = normalizedPos(e.clientX, e.clientY, e.buttons === 0);
   if (pos) sendInput({ t: 'mm', d: P.displayId, x: pos.x, y: pos.y });
 });
 
@@ -323,7 +327,7 @@ window.addEventListener('pointerdown', (e) => {
   e.preventDefault();
   // Sync the host position before the button event so the click lands exactly
   // where the pointer is.
-  const pos = normalizedPos(e.clientX, e.clientY);
+  const pos = normalizedPos(e.clientX, e.clientY, true);
   if (pos) sendInput({ t: 'mm', d: P.displayId, x: pos.x, y: pos.y });
   sendInput({ t: 'md', b: e.button === 1 ? 1 : e.button === 2 ? 2 : 0 });
 });

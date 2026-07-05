@@ -611,11 +611,26 @@ function renderHosts(hosts: HostEntry[]) {
     card.innerHTML = `
       <div class="screen-art">🖥</div>
       <div class="name"></div>
-      <div class="meta"></div>`;
+      <div class="meta"></div>
+      <div class="card-actions" style="margin-top: 10px; display: flex; justify-content: flex-end; gap: 8px;">
+        <button class="btn secondary small configure-btn" style="display: none;">Configure</button>
+      </div>`;
     card.querySelector('.name')!.textContent = h.name;
     card.querySelector('.meta')!.textContent =
       `${h.ip} · ${h.displays} display(s) · ${h.platform === 'darwin' ? 'macOS' : h.platform}`;
-    card.addEventListener('click', () => openConnectModal(h.ip, h.port, h.name, h.hostId));
+    
+    const isPaired = localStorage.getItem(`paired:${h.hostId}`) === '1';
+    const configBtn = card.querySelector('.configure-btn') as HTMLButtonElement;
+    if (isPaired && configBtn) {
+      configBtn.style.display = 'inline-flex';
+      configBtn.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        openConnectModal(h.ip, h.port, h.name, h.hostId, true);
+      });
+    }
+
+    card.addEventListener('click', () => openConnectModal(h.ip, h.port, h.name, h.hostId, false));
     grid.appendChild(card);
   }
 }
@@ -655,17 +670,20 @@ function clientId(): string {
   return id;
 }
 
-function openConnectModal(host: string, port: number, name: string, hostId: string) {
+let forceConfigure = false;
+
+function openConnectModal(host: string, port: number, name: string, hostId: string, forceConfig = false) {
   cm.host = host; cm.port = port; cm.name = name; cm.hostId = hostId;
   $('#cmTitle').textContent = `Connect to ${name}`;
   $('#connectModal').classList.add('visible');
+  forceConfigure = forceConfig;
 
   if (localStorage.getItem(`paired:${hostId}`) === '1') {
     // Already paired with this host before — skip the code prompt and
     // reconnect automatically. The host trusts our clientId.
     $('#cmStepCode').style.display = 'none';
     $('#cmStepScreens').style.display = 'none';
-    $('#cmSub').textContent = 'Reconnecting…';
+    $('#cmSub').textContent = forceConfig ? 'Connecting for configuration…' : 'Reconnecting…';
     runConnect('').catch(() => {
       // Host no longer trusts this client (e.g. its paired-devices list was
       // cleared) — fall back to asking for the pairing code again.
@@ -738,6 +756,22 @@ async function runConnect(code: string): Promise<void> {
     };
 
     cm.localMonitors = await warp.getLocalDisplays();
+
+    // Check if we already have a saved mapping and are reconnecting without forcing configuration
+    const saved = loadSavedMapping();
+    const isReconnect = !code;
+    if (saved && isReconnect && !forceConfigure) {
+      const slotsWithIndex = saved.slots.map((s, i) => ({
+        monIndex: i,
+        choice: s.choice,
+        res: s.res,
+        fps: s.fps,
+      }));
+      $('#cmSub').textContent = 'Starting streams…';
+      await startStreamingWithSlots(slotsWithIndex);
+      return;
+    }
+
     $('#cmTitle').textContent = `Screens on ${welcome.hostName}`;
     $('#cmSub').textContent = 'Choose what each of your monitors shows.';
     $('#cmStepCode').style.display = 'none';
@@ -879,6 +913,54 @@ function createVdisplayOverWs(width: number, height: number, hz: number): Promis
   });
 }
 
+async function startStreamingWithSlots(slots: { monIndex: number; choice: string; res: string; fps: string }[]) {
+  const wanted = slots.filter((w) => w.choice !== 'none');
+  if (!wanted.length) { toast('Select at least one screen', true); return; }
+
+  const screens: { displayId: number; targetDisplayId: number; label: string; fps: number }[] = [];
+  for (const w of wanted) {
+    const mon = cm.localMonitors[w.monIndex];
+    const fps = Number(w.fps) || Math.round(mon.refreshRate) || 60;
+    let displayId: number;
+
+    let choice = w.choice;
+    if (choice !== 'new' && choice !== 'none') {
+      const exists = cm.displays.some((d) => String(d.id) === choice);
+      if (!exists) choice = 'new'; // stale display ID fallback
+    }
+
+    if (choice === 'new') {
+      let width = mon.width, height = mon.height;
+      if (w.res !== 'auto') {
+        const [rw, rh] = w.res.split('x').map(Number);
+        if (rw && rh) { width = rw; height = rh; }
+      }
+      const res = await createVdisplayOverWs(width, height, fps);
+      if (!res.ok) throw new Error(res.error || 'Could not create virtual display');
+      displayId = res.displayId;
+    } else {
+      displayId = Number(choice);
+    }
+    screens.push({
+      displayId,
+      targetDisplayId: mon.id,
+      label: `${cm.name} · screen ${screens.length + 1}`,
+      fps,
+    });
+  }
+
+  // Remember this setup so the next connect restores it automatically.
+  localStorage.setItem(`map:${cm.hostId}`, JSON.stringify({
+    monCount: cm.localMonitors.length,
+    slots: slots.map(({ choice, res, fps }) => ({ choice, res, fps })),
+  } satisfies SavedMapping));
+
+  const code = localStorage.getItem(`code:${cm.hostId}`) || '';
+  await warp.openViewers({ host: cm.host, port: cm.port, code, clientId: clientId(), screens });
+  closeConnectModal();
+  toast(`Streaming ${screens.length} screen(s) from ${cm.name}`);
+}
+
 $('#cmStartBtn').addEventListener('click', async () => {
   const rows = $('#cmMapRows');
   const displaySelects = [...rows.querySelectorAll('select.sel-display')] as HTMLSelectElement[];
@@ -891,51 +973,13 @@ $('#cmStartBtn').addEventListener('click', async () => {
     res: resSelects[i]?.value || 'auto',
     fps: fpsSelects[i]?.value || '60',
   }));
-  const wanted = slots.filter((w) => w.choice !== 'none');
 
-  if (!wanted.length) { toast('Select at least one screen', true); return; }
   const btn = $('#cmStartBtn') as HTMLButtonElement;
   btn.disabled = true;
   btn.textContent = 'Preparing…';
 
   try {
-    const screens: { displayId: number; targetDisplayId: number; label: string; fps: number }[] = [];
-    for (const w of wanted) {
-      const mon = cm.localMonitors[w.monIndex];
-      const fps = Number(w.fps) || Math.round(mon.refreshRate) || 60;
-      let displayId: number;
-      if (w.choice === 'new') {
-        let width = mon.width, height = mon.height;
-        if (w.res !== 'auto') {
-          const [rw, rh] = w.res.split('x').map(Number);
-          if (rw && rh) { width = rw; height = rh; }
-        }
-        // Create the virtual display at the chosen frame rate so the host can
-        // actually capture it that fast (a 60 Hz display caps capture at 60).
-        const res = await createVdisplayOverWs(width, height, fps);
-        if (!res.ok) throw new Error(res.error || 'Could not create virtual display');
-        displayId = res.displayId;
-      } else {
-        displayId = Number(w.choice);
-      }
-      screens.push({
-        displayId,
-        targetDisplayId: mon.id,
-        label: `${cm.name} · screen ${screens.length + 1}`,
-        fps,
-      });
-    }
-
-    // Remember this setup so the next connect restores it automatically.
-    localStorage.setItem(`map:${cm.hostId}`, JSON.stringify({
-      monCount: cm.localMonitors.length,
-      slots: slots.map(({ choice, res, fps }) => ({ choice, res, fps })),
-    } satisfies SavedMapping));
-
-    const code = localStorage.getItem(`code:${cm.hostId}`) || '';
-    await warp.openViewers({ host: cm.host, port: cm.port, code, clientId: clientId(), screens });
-    closeConnectModal();
-    toast(`Streaming ${screens.length} screen(s) from ${cm.name}`);
+    await startStreamingWithSlots(slots);
   } catch (err: any) {
     toast(err.message, true);
   } finally {
