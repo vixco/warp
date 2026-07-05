@@ -19,6 +19,17 @@ const RENDERER = path.join(__dirname, '..', 'renderer');
 // before the displayMediaRequestHandler ever runs, breaking streaming.
 app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
 
+// Force WebRTC video onto the GPU hardware encoder (VideoToolbox on macOS).
+// By default Chromium keeps HW encoding behind a conservative GPU blocklist and
+// on many Macs silently falls back to the SOFTWARE H.264 encoder (OpenH264) —
+// which, at HiDPI resolutions across multiple monitors, both wrecks quality
+// (heavy quantization → the "heeeel laag" picture) and pegs the CPU so hard
+// that later streams can't keep up. Ignoring the blocklist is the single
+// biggest quality/throughput win for multi-monitor streaming; zero-copy keeps
+// captured frames on the GPU so they reach the encoder without a CPU round-trip.
+app.commandLine.appendSwitch('ignore-gpu-blocklist');
+app.commandLine.appendSwitch('enable-zero-copy');
+
 interface Settings {
   hostName: string;
   port: number;

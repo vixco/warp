@@ -50,31 +50,41 @@
     .overlay {
       position: fixed;
       top: 10px; left: 50%;
-      transform: translate(-50%, -140%);
-      display: flex; align-items: center; gap: 12px;
-      background: rgba(16, 20, 28, 0.92);
+      transform: translate(-50%, -160%);
+      display: flex; align-items: center; gap: 10px;
+      background: rgba(16, 20, 28, 0.94);
       border: 1px solid #263042;
       border-radius: 999px;
-      padding: 7px 16px;
+      padding: 6px 8px 6px 16px;
       color: #e7ecf4;
       font-family: -apple-system, "Segoe UI", system-ui, sans-serif;
       font-size: 12.5px;
-      transition: transform 0.18s ease;
+      transition: transform 0.16s ease, opacity 0.16s ease;
+      opacity: 0;
       z-index: 10;
+      box-shadow: 0 8px 30px rgba(0,0,0,0.45);
     }
-    .overlay.pinned, .hotzone:hover + .overlay, .overlay:hover {
+    /* .show is driven from JS the instant the pointer nears the top edge, so the
+       bar appears immediately instead of needing the cursor parked on a thin
+       hover strip. :hover keeps it up while the pointer is on the bar itself. */
+    .overlay.show, .overlay:hover {
       transform: translate(-50%, 0);
+      opacity: 1;
     }
     .overlay .label { font-weight: 600; }
     .overlay .stats { color: #8b96a8; font-variant-numeric: tabular-nums; }
+    .overlay .sep { width: 1px; align-self: stretch; background: #263042; margin: 2px 0; }
     .overlay button {
-      background: transparent; border: none; color: #8b96a8;
-      font: inherit; cursor: pointer; padding: 2px 6px;
+      background: transparent; border: none; color: #b7c0d0;
+      font: inherit; cursor: pointer; padding: 5px 8px; border-radius: 999px;
+      line-height: 1; display: inline-flex; align-items: center; gap: 5px;
     }
-    .overlay button:hover { color: #fff; }
-    .overlay .disconnect { color: #f87171; }
+    .overlay button:hover { color: #fff; background: rgba(255,255,255,0.08); }
+    .overlay button.settings { color: #e7ecf4; font-weight: 600; }
+    .overlay button.settings:hover { background: #4f7cff; color: #fff; }
+    .overlay .disconnect:hover { background: #b91c1c; color: #fff; }
     .hotzone {
-      position: fixed; top: 0; left: 25vw; width: 50vw; height: 14px;
+      position: fixed; top: 0; left: 0; width: 100vw; height: 8px;
       z-index: 9;
     }
 
@@ -127,6 +137,8 @@
   <div class="overlay" id="overlay">
     <span class="label" id="ovLabel">Warp</span>
     <span class="stats" id="ovStats">—</span>
+    <span class="sep"></span>
+    <button class="settings" id="ovSettings" title="Stream settings (Ctrl+Shift+M)">⚙ Settings</button>
     <button id="ovFullscreen" title="Toggle fullscreen (Ctrl+Shift+F)">⛶</button>
     <button class="disconnect" id="ovDisconnect" title="Disconnect (Ctrl+Shift+Q)">✕</button>
   </div>
@@ -166,6 +178,14 @@
         <option value="smooth">Smooth motion</option>
       </select>
     </div>
+    <div class="menu-row">
+      <label>Codec (encoder)</label>
+      <select id="menuCodec">
+        <option value="h264">H.264 — lowest latency</option>
+        <option value="vp9">VP9 — balanced</option>
+        <option value="av1">AV1 — best quality (heavier)</option>
+      </select>
+    </div>
     <div class="menu-row" id="rowSpeakers">
       <label>Speakers</label>
       <select id="menuSpeakers"></select>
@@ -179,7 +199,7 @@
       <button id="menuResume">Resume</button>
       <button id="menuDisconnect" class="danger">Disconnect</button>
     </div>
-    <div class="menu-hint">Ctrl+Shift+M menu · Ctrl+Shift+F fullscreen · Ctrl+Shift+Q disconnect</div>
+    <div class="menu-hint">Changes apply live · Ctrl+Shift+M menu · Ctrl+Shift+F fullscreen · Ctrl+Shift+Q disconnect</div>
   </div>
 
   <div class="status" id="status">

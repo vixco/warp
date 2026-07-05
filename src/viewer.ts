@@ -27,6 +27,7 @@ const statusSpinner = document.getElementById('statusSpinner')!;
 const statusRetry = document.getElementById('statusRetry') as HTMLButtonElement;
 const ovLabel = document.getElementById('ovLabel')!;
 const ovStats = document.getElementById('ovStats')!;
+const overlay = document.getElementById('overlay')!;
 
 ovLabel.textContent = P.label;
 document.title = `Warp — ${P.label}`;
@@ -404,6 +405,7 @@ setInterval(async () => {
 document.getElementById('ovDisconnect')!.addEventListener('click', disconnect);
 document.getElementById('ovFullscreen')!.addEventListener('click', () =>
   window.warp.viewerToggleFullscreen());
+document.getElementById('ovSettings')!.addEventListener('click', () => toggleMenu(true));
 
 function disconnect() {
   // Disconnecting one screen ends the whole session: every viewer closes.
@@ -419,6 +421,7 @@ const menuEl = document.getElementById('menu')!;
 const menuBitrate = document.getElementById('menuBitrate') as HTMLSelectElement;
 const menuFps = document.getElementById('menuFps') as HTMLSelectElement;
 const menuMode = document.getElementById('menuMode') as HTMLSelectElement;
+const menuCodec = document.getElementById('menuCodec') as HTMLSelectElement;
 document.getElementById('menuLabel')!.textContent = P.label;
 
 menuBitrate.value = [25, 50, 100, 150, 300, 400, 600].includes(P.bitrate) ? String(P.bitrate) : '150';
@@ -433,11 +436,15 @@ if (![...menuFps.options].some((o) => o.value === String(P.fps))) {
 }
 menuFps.value = String(P.fps);
 menuMode.value = P.mode === 'smooth' ? 'smooth' : 'sharp';
+menuCodec.value = ['h264', 'vp9', 'av1'].includes(P.codec) ? P.codec : 'h264';
 
 function toggleMenu(open = !menuOpen) {
   menuOpen = open;
   menuEl.classList.toggle('hidden', !menuOpen);
   document.body.classList.toggle('show-cursor', menuOpen);
+  // The full menu is its own surface, so the top pill bar shouldn't linger
+  // underneath it; the next pointer move near the top re-reveals the bar.
+  overlay.classList.remove('show');
   if (menuOpen) {
     sendInput({ t: 'reset' }); // release held keys/buttons
     populateAudioDevices();
@@ -460,16 +467,28 @@ document.getElementById('menuMic')!.addEventListener('change', async (e) => {
 });
 
 function sendCfg() {
-  sendInput({
-    t: 'cfg',
-    bitrate: Number(menuBitrate.value),
-    fps: Number(menuFps.value),
-    mode: menuMode.value,
-  });
+  // Persist the live choices onto P so a codec switch (which reconnects) keeps
+  // the latest bitrate/fps/mode instead of snapping back to connect-time values.
+  P.bitrate = Number(menuBitrate.value);
+  P.fps = Number(menuFps.value);
+  P.mode = menuMode.value;
+  sendInput({ t: 'cfg', bitrate: P.bitrate, fps: P.fps, mode: P.mode });
 }
 menuBitrate.addEventListener('change', sendCfg);
 menuFps.addEventListener('change', sendCfg);
 menuMode.addEventListener('change', sendCfg);
+
+// Switching codec means renegotiating the encoder, so we reconnect this screen
+// with the new codec (bitrate/fps/mode carry over via P). Quick and reliable —
+// a brief black flash, then the stream comes back on the chosen encoder.
+menuCodec.addEventListener('change', () => {
+  const next = menuCodec.value;
+  if (next === P.codec) return;
+  P.codec = next;
+  toggleMenu(false);
+  showStatus(`Switching to ${next.toUpperCase()}…`);
+  connect();
+});
 
 document.getElementById('menuFullscreen')!.addEventListener('click', () =>
   window.warp.viewerToggleFullscreen());
@@ -514,12 +533,42 @@ setInterval(async () => {
   } catch { /* ignore */ }
 }, 1000);
 
-// Reveal the local OS cursor only near the top hotzone (to reach the overlay)
-// and while the menu is open; over the picture the cursor stays hidden so the
-// only visible pointer is the real macOS cursor captured in the stream.
+// Reveal the top control bar (and the local OS cursor) the instant the pointer
+// nears the top edge — driven from JS rather than a thin CSS :hover strip, so
+// the bar shows immediately instead of needing the cursor parked precisely on a
+// 14px zone. Over the rest of the picture the cursor stays hidden so the only
+// visible pointer is the real macOS cursor captured in the stream.
+const TOP_REVEAL_PX = 90;
+let overlayHideTimer: ReturnType<typeof setTimeout> | undefined;
+
+function setOverlay(show: boolean) {
+  clearTimeout(overlayHideTimer);
+  if (show) {
+    overlay.classList.add('show');
+    document.body.classList.add('show-cursor');
+  } else {
+    // Small grace period so a quick move away doesn't yank the bar/cursor.
+    overlayHideTimer = setTimeout(() => {
+      overlay.classList.remove('show');
+      if (!menuOpen) document.body.classList.remove('show-cursor');
+    }, 250);
+  }
+}
+
 window.addEventListener('pointermove', (e) => {
-  if (menuOpen) return; // OS cursor stays visible while the menu is open
-  document.body.classList.toggle('show-cursor', e.clientY < 60);
+  if (menuOpen) return; // OS cursor + bar stay visible while the menu is open
+  setOverlay(e.clientY < TOP_REVEAL_PX);
 });
 
+// Flash the bar briefly on connect so the Settings button is discoverable,
+// then let it tuck away.
+function flashOverlay() {
+  overlay.classList.add('show');
+  clearTimeout(overlayHideTimer);
+  overlayHideTimer = setTimeout(() => {
+    if (!menuOpen) overlay.classList.remove('show');
+  }, 2600);
+}
+
 connect();
+flashOverlay();

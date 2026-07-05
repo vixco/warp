@@ -232,6 +232,20 @@ interface HostSession {
 class HostEngine {
   sessions = new Map<string, HostSession>();
 
+  // macOS/Electron desktop capture is NOT safe to acquire concurrently: when
+  // several viewer windows connect at once (multi-monitor), their start-screen
+  // messages all land in this single host renderer and race inside
+  // getUserMedia({chromeMediaSource:'desktop'}) — the first ones succeed and a
+  // later one deadlocks (the classic "monitor 3 just hangs" symptom). We fund
+  // one shared lock so each screen's capture is acquired strictly one after
+  // another; three concurrent streams then run fine once each is set up.
+  private captureLock: Promise<unknown> = Promise.resolve();
+  private serializeCapture<T>(fn: () => Promise<T>): Promise<T> {
+    const run = this.captureLock.then(fn, fn);
+    this.captureLock = run.catch(() => { /* keep the chain alive on failure */ });
+    return run;
+  }
+
   constructor() {
     warp.onEngineMessage(({ sessionId, msg }) => this.handle(sessionId, msg));
     setInterval(() => this.syncClipboard(), 1500);
@@ -256,7 +270,8 @@ class HostEngine {
   private async handle(sessionId: string, msg: any) {
     try {
       switch (msg.type) {
-        case 'start-screen': return await this.startScreen(sessionId, msg);
+        case 'start-screen':
+          return await this.serializeCapture(() => this.startScreen(sessionId, msg));
         case 'rtc-answer': {
           const s = this.sessions.get(sessionId);
           if (s) await s.pc.setRemoteDescription({ type: 'answer', sdp: msg.sdp });
@@ -299,7 +314,7 @@ class HostEngine {
     // (arrow/beam/resize/hand) moving across every screen.
     let stream: MediaStream;
     try {
-      stream = await (navigator.mediaDevices as any).getUserMedia({
+      const capture = (navigator.mediaDevices as any).getUserMedia({
         audio: false,
         video: {
           mandatory: {
@@ -312,7 +327,14 @@ class HostEngine {
             maxFrameRate: fps,
           },
         },
-      }) as MediaStream;
+      }) as Promise<MediaStream>;
+      // Never let a wedged capture hold the shared lock forever — bound it so a
+      // failed screen surfaces an error and lets the next screen proceed.
+      stream = await Promise.race([
+        capture,
+        new Promise<MediaStream>((_, rej) =>
+          setTimeout(() => rej(new Error('capture timed out')), 12000)),
+      ]);
     } catch (err: any) {
       console.error('display capture failed', err);
       warp.toSession(sessionId, {
@@ -538,7 +560,13 @@ function degradationFor(mode: string): 'maintain-resolution' | 'maintain-framera
 // (e.g. 200 Mbps) the instant something moves, with no quality ramp delay.
 function tuneVideoSdp(sdp: string, maxMbps: number): string {
   const maxKbps = Math.max(1000, Math.round(maxMbps * 1000));
-  const startKbps = Math.min(maxKbps, 40_000); // ~40 Mbps: instant sharp image
+  // Start high-but-safe, NOT at the full ceiling. Blasting e.g. 200 Mbps on the
+  // very first frames bursts the link; if it can't sustain that, congestion
+  // control collapses the bitrate and spikes latency for a second or two before
+  // recovering — exactly the "laggy + low quality right when I connect" feel.
+  // ~30 Mbps is already crisp for desktop/text immediately, and GCC climbs to
+  // the real ceiling within about a second on a link that can carry it.
+  const startKbps = Math.min(maxKbps, 30000);
   const minKbps = 500;                          // sip bandwidth when idle (VBR floor)
 
   const lines = sdp.split(/\r?\n/);
