@@ -30,6 +30,14 @@ app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
 app.commandLine.appendSwitch('ignore-gpu-blocklist');
 app.commandLine.appendSwitch('enable-zero-copy');
 
+// On a LAN, Chromium hides local IPs behind mDNS (.local) ICE candidates by
+// default. That obfuscation can prevent the direct host-to-host candidate pair
+// from forming, pushing traffic onto a slower reflexive/relayed path and adding
+// latency (and setup delay). Warp only ever streams between machines the user
+// has already paired on their own network, so expose the real local IPs for the
+// shortest, lowest-latency direct route.
+app.commandLine.appendSwitch('disable-features', 'WebRtcHideLocalIpsWithMdns');
+
 interface Settings {
   hostName: string;
   port: number;
@@ -56,7 +64,12 @@ function loadSettings(): Settings {
     pairingCode: '',
     trustedClients: [],
     fps: 60,
-    maxBitrateMbps: 200,   // VBR ceiling — idle stays near-zero, motion gets full quality
+    // VBR ceiling — idle stays near-zero, motion gets full quality. Kept
+    // moderate on purpose: a very high ceiling (e.g. 200) lets congestion
+    // control probe far past what WiFi can sustain, then back off hard — the
+    // oscillation that reads as periodic lag spikes. 100 is still overkill-sharp
+    // for 1440p desktop and much steadier; raise it in the menu on a wired LAN.
+    maxBitrateMbps: 100,
     codec: 'h264',
     hidpiVirtual: false,
     hostingEnabled: false,

@@ -221,10 +221,12 @@ $('#updRestartBtn').addEventListener('click', () => warp.installUpdate());
 interface HostSession {
   pc: RTCPeerConnection;
   stream: MediaStream | null;
-  channel: RTCDataChannel | null;
+  channel: RTCDataChannel | null;      // reliable/ordered: keys, clicks, clipboard
+  fastChannel: RTCDataChannel | null;  // unreliable/unordered: continuous mouse move
   displayId: number;
   sender: RTCRtpSender | null;
   track: MediaStreamTrack | null;
+  captureHeight: number;               // physical capture height, for resolution scaling
   audioStream: MediaStream | null;   // system audio being sent to the client
   micPlayer: HTMLAudioElement | null; // client microphone played on the host
 }
@@ -362,19 +364,32 @@ class HostEngine {
     // 'detail' preserves text sharpness at high bitrate; 'smooth' favors
     // fluid motion (gaming/video) — switchable live from the client menu.
     track.contentHint = msg.mode === 'smooth' ? 'motion' : 'detail';
+    const captureHeight = Number(src.height) || 1080;
 
     const pc = new RTCPeerConnection({
       iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
     });
     const session: HostSession = {
-      pc, stream, channel: null, displayId, sender: null, track,
-      audioStream: audioCapture, micPlayer: null,
+      pc, stream, channel: null, fastChannel: null, displayId, sender: null, track,
+      captureHeight, audioStream: audioCapture, micPlayer: null,
     };
     this.sessions.set(sessionId, session);
 
+    // Two data channels so continuous mouse movement never gets stuck behind a
+    // video retransmit:
+    //  • 'warp'      — reliable + ordered: keystrokes, clicks, clipboard.
+    //  • 'warp-fast' — unordered, no retransmit: high-rate pointer moves, where
+    //    the newest position supersedes any dropped one, so waiting on a resend
+    //    would only add latency.
     const channel = pc.createDataChannel('warp', { ordered: true });
     session.channel = channel;
     channel.onmessage = (e) => this.onChannelMessage(sessionId, e.data);
+
+    const fastChannel = pc.createDataChannel('warp-fast', {
+      ordered: false, maxRetransmits: 0,
+    });
+    session.fastChannel = fastChannel;
+    fastChannel.onmessage = (e) => this.onChannelMessage(sessionId, e.data);
 
     const transceiver = pc.addTransceiver(track, {
       direction: 'sendonly',
@@ -421,6 +436,7 @@ class HostEngine {
 
     const mbps = Number(msg.bitrate) || 150;
     const mode = msg.mode === 'smooth' ? 'smooth' : 'sharp';
+    const maxHeight = Number(msg.maxHeight) || 0; // 0 = native, else cap encode height
 
     const offer = await pc.createOffer();
     // Tune the encoder's bitrate envelope in the SDP (see tuneVideoSdp): high
@@ -439,7 +455,7 @@ class HostEngine {
         params.encodings = params.encodings?.length ? params.encodings : [{}];
         params.encodings[0].maxBitrate = mbps * 1_000_000;
         params.encodings[0].maxFramerate = fps;
-        params.encodings[0].scaleResolutionDownBy = 1; // never downscale
+        params.encodings[0].scaleResolutionDownBy = scaleFor(captureHeight, maxHeight);
         (params.encodings[0] as any).priority = 'high';
         (params.encodings[0] as any).networkPriority = 'high';
         (params as any).degradationPreference = degradationFor(mode);
@@ -479,6 +495,12 @@ class HostEngine {
         params.encodings = params.encodings?.length ? params.encodings : [{}];
         if (cfg.bitrate) params.encodings[0].maxBitrate = Number(cfg.bitrate) * 1_000_000;
         if (cfg.fps) params.encodings[0].maxFramerate = Number(cfg.fps);
+        // Live resolution cap: fewer pixels to encode/transmit/decode is the
+        // biggest latency lever on a high-DPI host.
+        if (cfg.maxHeight !== undefined) {
+          params.encodings[0].scaleResolutionDownBy =
+            scaleFor(s.captureHeight, Number(cfg.maxHeight) || 0);
+        }
         // Keep the sacrifice-order aligned with the live picture-mode switch.
         if (cfg.mode) (params as any).degradationPreference = degradationFor(cfg.mode);
         await s.sender.setParameters(params);
@@ -514,6 +536,7 @@ class HostEngine {
     if (!s) return;
     this.sessions.delete(sessionId);
     try { s.channel?.close(); } catch { /* ignore */ }
+    try { s.fastChannel?.close(); } catch { /* ignore */ }
     try { s.pc.close(); } catch { /* ignore */ }
     s.stream?.getTracks().forEach((t) => t.stop());
     s.audioStream?.getTracks().forEach((t) => t.stop());
@@ -539,12 +562,23 @@ async function findVirtualAudioDevice(): Promise<string | null> {
   } catch { return null; }
 }
 
-// Under network/CPU constraint, decide what to sacrifice first. Desktop/text
-// ('sharp') holds resolution and drops frames — a crisp-but-choppier picture
-// keeps text readable. Gaming/video ('smooth') holds the frame rate and lets
-// resolution soften — fluid motion matters more than pixel-exactness.
-function degradationFor(mode: string): 'maintain-resolution' | 'maintain-framerate' {
-  return mode === 'smooth' ? 'maintain-framerate' : 'maintain-resolution';
+// Downscale factor to cap the encoded height at `maxHeight` (0/native = 1).
+// Fewer pixels to encode, transmit and decode is the single biggest lever on
+// latency and encoder overload — a Retina/4K/5K host pushing native pixels at a
+// high frame rate saturates even the hardware encoder, so frames queue and the
+// felt latency grows. Returns a divisor for scaleResolutionDownBy.
+function scaleFor(captureHeight: number, maxHeight: number): number {
+  if (!maxHeight || maxHeight <= 0 || captureHeight <= maxHeight) return 1;
+  return captureHeight / maxHeight;
+}
+
+// Under network/CPU constraint, decide what to sacrifice first. 'smooth'
+// (gaming/video) holds the frame rate and lets resolution soften. 'sharp'
+// (desktop/text) uses 'balanced': it sheds a little of both resolution and
+// frame rate so a transient WiFi hiccup recovers in a frame or two instead of
+// stalling on full-resolution frames — which is what reads as a lag spike.
+function degradationFor(mode: string): 'balanced' | 'maintain-framerate' {
+  return mode === 'smooth' ? 'maintain-framerate' : 'balanced';
 }
 
 // Widen the video encoder's bitrate envelope directly in the offer SDP. This

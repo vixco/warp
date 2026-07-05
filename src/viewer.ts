@@ -14,6 +14,10 @@ const P = {
   bitrate: Number(params.get('bitrate')) || 150,
   codec: params.get('codec') || 'h264',
   mode: params.get('mode') || 'sharp',
+  // Cap the encoded height on the host (0 = native). Default 1440 = "Auto":
+  // high-DPI/4K/5K hosts stop encoding native pixels (the main latency win),
+  // while 1080p/1440p hosts are left untouched. Tunable live from the menu.
+  maxHeight: params.get('maxHeight') != null ? Number(params.get('maxHeight')) : 1440,
   label: params.get('label') || 'Warp',
   screenIndex: Number(params.get('screenIndex')) || 0,
 };
@@ -34,7 +38,8 @@ document.title = `Warp — ${P.label}`;
 
 let ws: WebSocket | null = null;
 let pc: RTCPeerConnection | null = null;
-let channel: RTCDataChannel | null = null;
+let channel: RTCDataChannel | null = null;       // reliable: keys, clicks, clipboard
+let fastChannel: RTCDataChannel | null = null;   // unreliable: continuous mouse move
 let sessionEnded = false;
 
 function showStatus(msg: string, retry = false) {
@@ -50,9 +55,10 @@ function hideStatus() {
 
 function cleanup() {
   try { channel?.close(); } catch { /* ignore */ }
+  try { fastChannel?.close(); } catch { /* ignore */ }
   try { pc?.close(); } catch { /* ignore */ }
   if (ws) { ws.onclose = null; try { ws.close(); } catch { /* ignore */ } }
-  channel = null; pc = null; ws = null;
+  channel = null; fastChannel = null; pc = null; ws = null;
   micStream?.getTracks().forEach((t) => t.stop());
   micStream = null;
 }
@@ -82,6 +88,7 @@ function connect() {
           bitrate: P.bitrate,
           codec: P.codec,
           mode: P.mode,
+          maxHeight: P.maxHeight,
           wantAudio: WANT_AUDIO,
         }));
         break;
@@ -138,6 +145,12 @@ async function acceptOffer(sdp: string) {
   };
 
   pc.ondatachannel = (e) => {
+    // The host opens two channels; hold a reference to the unreliable one so
+    // high-rate pointer moves can be sent on it (client→host only).
+    if (e.channel.label === 'warp-fast') {
+      fastChannel = e.channel;
+      return;
+    }
     channel = e.channel;
     channel.onmessage = (ev) => {
       try {
@@ -157,7 +170,18 @@ async function acceptOffer(sdp: string) {
 
   pc.onconnectionstatechange = () => {
     if (!pc) return;
-    if (pc.connectionState === 'connected') hideStatus();
+    if (pc.connectionState === 'connected') {
+      hideStatus();
+      // Re-assert zero playout delay on every receiver once negotiated — some
+      // Chromium versions reset the hint after the track is wired up, which
+      // silently re-introduces a jitter buffer (the "constant small delay").
+      pc.getReceivers().forEach((r) => {
+        try {
+          (r as any).jitterBufferTarget = 0;
+          (r as any).playoutDelayHint = 0;
+        } catch { /* best effort */ }
+      });
+    }
     if (['failed', 'disconnected'].includes(pc.connectionState) && !sessionEnded) {
       showStatus('Stream interrupted. Reconnecting…');
       setTimeout(() => { if (!sessionEnded) connect(); }, 1500);
@@ -288,8 +312,19 @@ async function populateAudioDevices() {
 // ---------------------------------------------------------------------------
 // Input capture
 
+// Reliable/ordered path: keystrokes, clicks, clipboard — anything where a drop
+// or reorder would corrupt state (a lost keyup leaves a stuck key).
 function sendInput(ev: object) {
   if (channel?.readyState === 'open') channel.send(JSON.stringify(ev));
+}
+
+// Unreliable/unordered path for high-rate pointer moves: the newest position
+// supersedes any dropped one, so movement never head-of-line-blocks behind a
+// video retransmit. Falls back to the reliable channel if the fast one isn't
+// open yet.
+function sendFast(ev: object) {
+  const ch = fastChannel?.readyState === 'open' ? fastChannel : channel;
+  if (ch?.readyState === 'open') ch.send(JSON.stringify(ev));
 }
 
 // Map a client-window point to normalized coords on the remote display,
@@ -319,7 +354,7 @@ window.addEventListener('pointermove', (e) => {
   lastMove = now;
   // If dragging (buttons > 0), don't clamp so we can cross monitor borders
   const pos = normalizedPos(e.clientX, e.clientY, e.buttons === 0);
-  if (pos) sendInput({ t: 'mm', d: P.displayId, x: pos.x, y: pos.y });
+  if (pos) sendFast({ t: 'mm', d: P.displayId, x: pos.x, y: pos.y });
 });
 
 window.addEventListener('pointerdown', (e) => {
@@ -337,6 +372,10 @@ window.addEventListener('pointerup', (e) => {
   if (menuOpen) return;
   if ((e.target as HTMLElement).closest('.overlay, .hotzone')) return;
   e.preventDefault();
+  // Reliably sync the final position before the release so a drag ends exactly
+  // where the pointer is, even if the last unreliable move was dropped.
+  const pos = normalizedPos(e.clientX, e.clientY, true);
+  if (pos) sendInput({ t: 'mm', d: P.displayId, x: pos.x, y: pos.y });
   sendInput({ t: 'mu', b: e.button === 1 ? 1 : e.button === 2 ? 2 : 0 });
 });
 
@@ -422,6 +461,7 @@ const menuBitrate = document.getElementById('menuBitrate') as HTMLSelectElement;
 const menuFps = document.getElementById('menuFps') as HTMLSelectElement;
 const menuMode = document.getElementById('menuMode') as HTMLSelectElement;
 const menuCodec = document.getElementById('menuCodec') as HTMLSelectElement;
+const menuRes = document.getElementById('menuRes') as HTMLSelectElement;
 document.getElementById('menuLabel')!.textContent = P.label;
 
 menuBitrate.value = [25, 50, 100, 150, 300, 400, 600].includes(P.bitrate) ? String(P.bitrate) : '150';
@@ -437,6 +477,7 @@ if (![...menuFps.options].some((o) => o.value === String(P.fps))) {
 menuFps.value = String(P.fps);
 menuMode.value = P.mode === 'smooth' ? 'smooth' : 'sharp';
 menuCodec.value = ['h264', 'vp9', 'av1'].includes(P.codec) ? P.codec : 'h264';
+menuRes.value = [0, 720, 1080, 1440].includes(P.maxHeight) ? String(P.maxHeight) : '1440';
 
 function toggleMenu(open = !menuOpen) {
   menuOpen = open;
@@ -468,15 +509,17 @@ document.getElementById('menuMic')!.addEventListener('change', async (e) => {
 
 function sendCfg() {
   // Persist the live choices onto P so a codec switch (which reconnects) keeps
-  // the latest bitrate/fps/mode instead of snapping back to connect-time values.
+  // the latest settings instead of snapping back to connect-time values.
   P.bitrate = Number(menuBitrate.value);
   P.fps = Number(menuFps.value);
   P.mode = menuMode.value;
-  sendInput({ t: 'cfg', bitrate: P.bitrate, fps: P.fps, mode: P.mode });
+  P.maxHeight = Number(menuRes.value);
+  sendInput({ t: 'cfg', bitrate: P.bitrate, fps: P.fps, mode: P.mode, maxHeight: P.maxHeight });
 }
 menuBitrate.addEventListener('change', sendCfg);
 menuFps.addEventListener('change', sendCfg);
 menuMode.addEventListener('change', sendCfg);
+menuRes.addEventListener('change', sendCfg);
 
 // Switching codec means renegotiating the encoder, so we reconnect this screen
 // with the new codec (bitrate/fps/mode carry over via P). Quick and reliable —
