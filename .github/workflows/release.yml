@@ -27,6 +27,11 @@ env:
 jobs:
   mac:
     runs-on: macos-latest
+    # Secrets are surfaced as job-level env so steps can test them in `if:`
+    # (the `secrets` context itself is not allowed in step `if` expressions).
+    env:
+      MAC_CSC_LINK: ${{ secrets.MAC_CSC_LINK }}
+      MAC_CSC_KEY_PASSWORD: ${{ secrets.MAC_CSC_KEY_PASSWORD }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -47,10 +52,7 @@ jobs:
       # secrets aren't set (falls back to the ad-hoc seal).
       - name: Set up self-signed signing keychain
         id: signing
-        if: ${{ secrets.MAC_CSC_LINK != '' }}
-        env:
-          MAC_CSC_LINK: ${{ secrets.MAC_CSC_LINK }}
-          MAC_CSC_KEY_PASSWORD: ${{ secrets.MAC_CSC_KEY_PASSWORD }}
+        if: ${{ env.MAC_CSC_LINK != '' }}
         run: |
           set -euo pipefail
           KC="$RUNNER_TEMP/warp-signing.keychain-db"
