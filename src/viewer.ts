@@ -21,10 +21,12 @@ const P = {
   bitrate: Number(params.get('bitrate')) || 150,
   codec: params.get('codec') || 'h264',
   mode: params.get('mode') || 'sharp',
-  // Cap the encoded height on the host (0 = native). Default 1440 = "Auto":
-  // high-DPI/4K/5K hosts stop encoding native pixels (the main latency win),
-  // while 1080p/1440p hosts are left untouched. Tunable live from the menu.
-  maxHeight: params.get('maxHeight') != null ? Number(params.get('maxHeight')) : 1440,
+  // Cap the encoded height on the host (0 = native). Default 2160 = "Auto (4K)":
+  // 4K hosts stream their native pixels and 5K hosts downscale to a still-sharp
+  // 4K, while 1080p/1440p hosts are left untouched. This is the single biggest
+  // sharpness lever — the old 1440p cap softened text on high-DPI Macs. Tunable
+  // live from the menu; drop it to trade sharpness for latency on a weak link.
+  maxHeight: params.get('maxHeight') != null ? Number(params.get('maxHeight')) : 2160,
   label: params.get('label') || 'Warp',
   screenIndex: Number(params.get('screenIndex')) || 0,
   // Host suppressed the OS cursor in the video → we render our own local cursor.
@@ -709,7 +711,7 @@ function decodableCodecs(): Set<string> {
   const allowed = [...menuCodec.options].map((o) => o.value);
   menuCodec.value = allowed.includes(P.codec) ? P.codec : 'h264';
 })();
-menuRes.value = [0, 720, 1080, 1440].includes(P.maxHeight) ? String(P.maxHeight) : '1440';
+menuRes.value = [0, 720, 1080, 1440, 2160].includes(P.maxHeight) ? String(P.maxHeight) : '2160';
 
 const menuKbd = document.getElementById('menuKbd') as HTMLSelectElement;
 menuKbd.value = ctrlCmdSwap ? 'swap' : 'native';

@@ -915,11 +915,13 @@ function scaleFor(captureHeight: number, maxHeight: number): number {
 
 // Under network/CPU constraint, decide what to sacrifice first. 'smooth'
 // (gaming/video) holds the frame rate and lets resolution soften. 'sharp'
-// (desktop/text) uses 'balanced': it sheds a little of both resolution and
-// frame rate so a transient WiFi hiccup recovers in a frame or two instead of
-// stalling on full-resolution frames — which is what reads as a lag spike.
-function degradationFor(mode: string): 'balanced' | 'maintain-framerate' {
-  return mode === 'smooth' ? 'maintain-framerate' : 'balanced';
+// (desktop/text) now uses 'maintain-resolution': the whole point of the sharp
+// preset is a crisp picture, so a transient hiccup should cost a few frames of
+// smoothness, never the resolution — softening the image is exactly what the
+// user picked this mode to avoid. On a wired LAN (the target) real constraint
+// is rare anyway, so this almost never engages; when it does, text stays sharp.
+function degradationFor(mode: string): 'maintain-resolution' | 'maintain-framerate' {
+  return mode === 'smooth' ? 'maintain-framerate' : 'maintain-resolution';
 }
 
 // Widen the video encoder's bitrate envelope directly in the offer SDP. This

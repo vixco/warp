@@ -105,7 +105,23 @@ interface Settings {
   // Suppress the OS cursor in the captured video and let the viewer render its
   // own cursor locally at full refresh (instant pointer feel, Parsec-style).
   suppressCursor: boolean;
+  // One-time forward-migration marker for the quality defaults (resolution +
+  // bitrate). Lets us lift users who were still on a *previous* shipped default
+  // up to a sharper new one exactly once, without ever clobbering a value they
+  // deliberately chose in Settings. Absent on pre-migration files.
+  qualityDefaultsRev?: number;
 }
+
+// Bump when the sharpness defaults below change and existing users on the OLD
+// default should be carried forward to the new one. Each (rev → {field: oldVal})
+// pair is applied at most once per user; a field the user hand-edited away from
+// oldVal is left untouched.
+const QUALITY_DEFAULTS_REV = 1;
+const QUALITY_MIGRATIONS: Record<number, Partial<Settings>> = {
+  // rev 1: the 1440p / 100 Mbps era softened text on 4K/5K Macs. Anyone still
+  // sitting on those exact numbers gets the sharper 2160 / 150 defaults.
+  1: { maxHeight: 1440, maxBitrateMbps: 100 },
+};
 
 const settingsFile = () => path.join(app.getPath('userData'), 'settings.json');
 
@@ -116,13 +132,19 @@ function loadSettings(): Settings {
     pairingCode: '',
     trustedClients: [],
     fps: 60,
-    // VBR ceiling — idle stays near-zero, motion gets full quality. Kept
-    // moderate on purpose: a very high ceiling (e.g. 200) lets congestion
-    // control probe far past what WiFi can sustain, then back off hard — the
-    // oscillation that reads as periodic lag spikes. 100 is still overkill-sharp
-    // for 1440p desktop and much steadier; raise it in the menu on a wired LAN.
-    maxBitrateMbps: 100,
-    maxHeight: 1440,
+    // VBR ceiling — idle stays near-zero, motion gets full quality. On a wired
+    // LAN (the target here) congestion control has real headroom, so we default
+    // higher to keep the extra 4K pixels genuinely sharp instead of starved:
+    // more resolution at the same old 100 Mbps would just trade a soft downscale
+    // for compression mush. 150 Mbps of HEVC is crisp at 4K; drop it in the menu
+    // if a link ever oscillates (the classic WiFi lag-spike symptom).
+    maxBitrateMbps: 150,
+    // Encode-height cap shared by every screen. 2160 = stream 4K hosts at their
+    // native pixels (and 5K hosts downscaled to a still-sharp 4K) instead of the
+    // old 1440p, which visibly softened text on high-DPI Macs. Network is not the
+    // bottleneck on a wired LAN, so the pixels are worth it; pick a lower cap in
+    // the menu to shed latency on a constrained link.
+    maxHeight: 2160,
     // HEVC by default: ~40% better quality-per-bit than H.264, so the same
     // picture is fewer bytes to push (steadier on WiFi) or sharper at the same
     // bitrate. Viewers that can't hardware-decode HEVC fall back to H.264
@@ -139,9 +161,35 @@ function loadSettings(): Settings {
     suppressCursor: false,
   };
   try {
-    return { ...defaults, ...JSON.parse(fs.readFileSync(settingsFile(), 'utf8')) };
+    const merged: Settings = {
+      ...defaults,
+      ...JSON.parse(fs.readFileSync(settingsFile(), 'utf8')),
+    };
+    // Forward-migrate the quality defaults exactly once. For each rev the user
+    // hasn't seen yet, any field still holding that rev's OLD default is lifted
+    // to the (already-merged) NEW default; a value the user changed themselves
+    // no longer matches oldVal, so it's preserved.
+    const fromRev = merged.qualityDefaultsRev ?? 0;
+    if (fromRev < QUALITY_DEFAULTS_REV) {
+      for (let rev = fromRev + 1; rev <= QUALITY_DEFAULTS_REV; rev++) {
+        const oldDefaults = QUALITY_MIGRATIONS[rev];
+        if (!oldDefaults) continue;
+        const m = merged as unknown as Record<string, unknown>;
+        const d = defaults as unknown as Record<string, unknown>;
+        const old = oldDefaults as Record<string, unknown>;
+        for (const key of Object.keys(old)) {
+          if (m[key] === old[key]) m[key] = d[key];
+        }
+      }
+      merged.qualityDefaultsRev = QUALITY_DEFAULTS_REV;
+      // Persist the bump so it's applied once, not re-evaluated every launch —
+      // and so a later deliberate re-pick of the old value sticks. Safe: we only
+      // reach here because a settings file already existed and was read above.
+      try { fs.writeFileSync(settingsFile(), JSON.stringify(merged, null, 2)); } catch { /* ignore */ }
+    }
+    return merged;
   } catch {
-    return defaults;
+    return { ...defaults, qualityDefaultsRev: QUALITY_DEFAULTS_REV };
   }
 }
 
