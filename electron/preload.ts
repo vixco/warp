@@ -31,6 +31,9 @@ contextBridge.exposeInMainWorld('warp', {
   queueCaptureDisplay: (displayId: number) =>
     ipcRenderer.send('set-pending-capture-display', displayId),
   injectInput: (ev: any) => ipcRenderer.send('input-event', ev),
+  onCursorUpdate: (fn: (m: any) => void) =>
+    ipcRenderer.on('cursor-update', (_e, m) => fn(m)),
+  requestCursorSnapshot: () => ipcRenderer.send('request-cursor-snapshot'),
 
   // discovery / client
   getDiscoveredHosts: () => ipcRenderer.invoke('get-discovered-hosts'),

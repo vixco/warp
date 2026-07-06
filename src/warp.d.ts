@@ -16,9 +16,11 @@ export interface WarpApi {
   installUpdate(): Promise<void>;
   onEngineMessage(fn: (data: { sessionId: string; msg: any }) => void): void;
   toSession(sessionId: string, msg: any): void;
-  getCaptureSource(displayId: number): Promise<{ id: string; name: string } | null>;
+  getCaptureSource(displayId: number): Promise<{ id: string; name: string; width: number; height: number; scaleFactor: number } | null>;
   queueCaptureDisplay(displayId: number): void;
   injectInput(ev: any): void;
+  onCursorUpdate(fn: (m: any) => void): void;
+  requestCursorSnapshot(): void;
   getDiscoveredHosts(): Promise<any[]>;
   onDiscoveredHosts(fn: (hosts: any[]) => void): void;
   getLocalDisplays(): Promise<any[]>;

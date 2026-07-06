@@ -102,6 +102,9 @@ interface Settings {
   audioSource: string;   // 'auto' = system loopback, else input deviceId
   micSink: string;       // where client mic plays on the host ('default' or deviceId)
   mainWindowBounds: { x: number; y: number; width: number; height: number } | null;
+  // Suppress the OS cursor in the captured video and let the viewer render its
+  // own cursor locally at full refresh (instant pointer feel, Parsec-style).
+  suppressCursor: boolean;
 }
 
 const settingsFile = () => path.join(app.getPath('userData'), 'settings.json');
@@ -133,6 +136,7 @@ function loadSettings(): Settings {
     audioSource: 'auto',
     micSink: 'default',
     mainWindowBounds: null,
+    suppressCursor: false,
   };
   try {
     return { ...defaults, ...JSON.parse(fs.readFileSync(settingsFile(), 'utf8')) };
@@ -268,6 +272,7 @@ async function startHosting(): Promise<{ ok: boolean; error?: string }> {
 
   hostServer = server;
   helpers.startHosting();
+  if (settings.suppressCursor) helpers.startCursor();
   discovery.startAnnouncing(() => ({
     hostId: machineId(),
     name: settings.hostName,
@@ -583,7 +588,7 @@ function openViewerWindow(opts: {
   sessionId: string; host: string; port: number; code: string; clientId: string;
   displayId: number; screenIndex: number; targetDisplayId?: number;
   fps: number; bitrateMbps: number; maxHeight: number; codec: string; mode: string; label: string;
-  screenMap?: string;
+  clientCursor: boolean; screenMap?: string;
 }) {
   const target = screen.getAllDisplays().find((d) => d.id === opts.targetDisplayId)
     ?? screen.getPrimaryDisplay();
@@ -619,6 +624,7 @@ function openViewerWindow(opts: {
     codec: opts.codec,
     mode: opts.mode,
     label: opts.label,
+    clientCursor: opts.clientCursor ? '1' : '0',
     screenMap: opts.screenMap || '[]',
   });
   win.loadFile(path.join(RENDERER, 'viewer.html'), { search: params.toString() });
@@ -636,12 +642,21 @@ function openViewerWindow(opts: {
 function wireIpc() {
   ipcMain.handle('get-settings', () => settings);
   ipcMain.handle('set-settings', (_e, patch: Partial<Settings>) => {
+    const wasSuppress = settings.suppressCursor;
     settings = { ...settings, ...patch };
     saveSettings();
     applyLoginItemSettings();
     refreshTrayMenu();
+    // Start/stop the cursor helper live when the toggle changes while hosting.
+    if (settings.suppressCursor !== wasSuppress && hostServer?.running) {
+      settings.suppressCursor ? helpers.startCursor() : helpers.stopCursor();
+    }
     return settings;
   });
+
+  // Cursor helper -> host renderer (host engine broadcasts it to the clients).
+  helpers.onCursor = (m) => mainWindow?.webContents.send('cursor-update', m);
+  ipcMain.on('request-cursor-snapshot', () => helpers.requestCursorSnapshot());
 
   ipcMain.handle('get-host-state', () => hostState());
   ipcMain.handle('start-hosting', () => startHosting());
@@ -681,6 +696,7 @@ function wireIpc() {
       name: src.name,
       width: Math.round(disp.size.width * disp.scaleFactor),
       height: Math.round(disp.size.height * disp.scaleFactor),
+      scaleFactor: disp.scaleFactor,
     };
   });
 
@@ -734,6 +750,7 @@ function wireIpc() {
         codec: settings.codec,
         mode: settings.streamMode,
         label: s.label,
+        clientCursor: settings.suppressCursor,
         screenMap,
       });
     });

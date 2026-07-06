@@ -48,6 +48,7 @@ async function loadSettingsUi() {
   ($('#setPort') as HTMLInputElement).value = String(settings.port);
   ($('#setPairingCode') as HTMLInputElement).value = settings.pairingCode;
   ($('#setHidpi') as HTMLInputElement).checked = !!settings.hidpiVirtual;
+  ($('#setSuppressCursor') as HTMLInputElement).checked = !!settings.suppressCursor;
   ($('#setLaunchAtLogin') as HTMLInputElement).checked = !!settings.launchAtLogin;
   ($('#setAudioEnabled') as HTMLInputElement).checked = settings.audioEnabled !== false;
   await populateHostAudioDevices();
@@ -88,6 +89,7 @@ $('#saveSettingsBtn').addEventListener('click', async () => {
     port: Number(($('#setPort') as HTMLInputElement).value) || 9750,
     pairingCode: ($('#setPairingCode') as HTMLInputElement).value.replace(/\D/g, ''),
     hidpiVirtual: ($('#setHidpi') as HTMLInputElement).checked,
+    suppressCursor: ($('#setSuppressCursor') as HTMLInputElement).checked,
     launchAtLogin: ($('#setLaunchAtLogin') as HTMLInputElement).checked,
     audioEnabled: ($('#setAudioEnabled') as HTMLInputElement).checked,
     audioSource: ($('#setAudioSource') as HTMLSelectElement).value,
@@ -232,6 +234,7 @@ interface HostSession {
   sender: RTCRtpSender | null;
   track: MediaStreamTrack | null;
   captureHeight: number;               // physical capture height, for resolution scaling
+  scaleFactor: number;                 // host display backing-scale, for cursor sizing
   reqBitrate: number;                  // this screen's requested ceiling (Mbps), pre-sharing
   audioStream: MediaStream | null;   // system audio being sent to the client
   micPlayer: HTMLAudioElement | null; // client microphone played on the host
@@ -328,8 +331,13 @@ class HostEngine {
     }
   }
 
+  // Latest cursor image from the native helper, forwarded to every viewer so it
+  // can render an exact local cursor. Only populated when cursor suppression is on.
+  private lastCursor: any = null;
+
   constructor() {
     warp.onEngineMessage(({ sessionId, msg }) => this.handle(sessionId, msg));
+    warp.onCursorUpdate((m) => this.onCursorUpdate(m));
     setInterval(() => this.syncClipboard(), 1500);
     // Adaptive-quality control tick: one AIMD step per session per second.
     setInterval(() => { for (const [id, s] of this.sessions) this.adaptTick(id, s); }, ADAPT_INTERVAL_MS);
@@ -416,6 +424,32 @@ class HostEngine {
     } catch { /* transient renegotiation; next tick fixes it */ }
   }
 
+  // A new cursor image (or hidden state) arrived from the host: remember it and
+  // push it to every connected screen. Placement is done entirely client-side at
+  // the viewer's own pointer, so only the image + hotspot + size is streamed, and
+  // only when the cursor shape actually changes.
+  private onCursorUpdate(m: any) {
+    this.lastCursor = m;
+    for (const s of this.sessions.values()) this.sendCursorToSession(s, m);
+  }
+
+  private sendCursorToSession(s: HostSession, m: any) {
+    if (!m || s.channel?.readyState !== 'open') return;
+    try {
+      if (m.hidden) { s.channel.send(JSON.stringify({ t: 'cur', hidden: 1 })); return; }
+      // Size the cursor as a fraction of the host display height so the viewer
+      // can scale it correctly through any encode-downscale / letterbox / viewer
+      // DPI: cursor points × host backing-scale ÷ captured pixel height.
+      const fracH = (Number(m.sh) * (s.scaleFactor || 1)) / (s.captureHeight || 1080);
+      s.channel.send(JSON.stringify({
+        t: 'cur', png: m.png, fracH,
+        hotFracX: m.sw ? m.hx / m.sw : 0,
+        hotFracY: m.sh ? m.hy / m.sh : 0,
+        aspect: m.ph ? m.pw / m.ph : 1,
+      }));
+    } catch { /* ignore */ }
+  }
+
   private lastClip = '';
   private async syncClipboard() {
     if (this.sessions.size === 0) return;
@@ -485,28 +519,47 @@ class HostEngine {
     // establish per display — and because captures are serialized (below), each
     // extra screen then waited minutes before its picture appeared. Native
     // capture negotiates instantly, so all monitors come up at once.
-    const captureHeight = Number(src.height) || 1080;
+    let captureHeight = Number(src.height) || 1080;
+    const scaleFactor = Number(src.scaleFactor) || 1;
 
-    // Each screen names its own source id explicitly (chromeMediaSourceId) — no
-    // shared global slot, so three concurrent screens never race for the wrong
-    // display. The real OS cursor stays in the frames so the user sees the true
-    // macOS pointer (arrow/beam/resize/hand) moving across every screen.
+    // When cursor suppression is on, the OS cursor must NOT be baked into the
+    // video (the viewer draws its own). Only getDisplayMedia can drop it
+    // (cursor:'never' → ScreenCaptureKit showsCursor=NO); the legacy getUserMedia
+    // desktop path has no cursor option. We keep NATIVE size via `ideal` (never
+    // exact/min=max — that scaled path is what once made monitors black/slow) and
+    // queue the target display for the main-process handler. Otherwise (default)
+    // keep the proven getUserMedia path with the real cursor in frames.
+    const suppressCursor = hostSettings.suppressCursor === true;
     let stream: MediaStream;
     try {
-      const capture = (navigator.mediaDevices as any).getUserMedia({
-        audio: false,
-        video: {
-          mandatory: {
-            chromeMediaSource: 'desktop',
-            chromeMediaSourceId: src.id,
-            minWidth: src.width || 640,
-            minHeight: src.height || 480,
-            maxWidth: src.width || 8192,
-            maxHeight: src.height || 8192,
-            maxFrameRate: fps,
+      let capture: Promise<MediaStream>;
+      if (suppressCursor) {
+        warp.queueCaptureDisplay(displayId);
+        capture = (navigator.mediaDevices as any).getDisplayMedia({
+          audio: false,
+          video: {
+            cursor: 'never',
+            frameRate: fps,
+            width: { ideal: src.width || 1920 },
+            height: { ideal: src.height || 1080 },
           },
-        },
-      }) as Promise<MediaStream>;
+        }) as Promise<MediaStream>;
+      } else {
+        capture = (navigator.mediaDevices as any).getUserMedia({
+          audio: false,
+          video: {
+            mandatory: {
+              chromeMediaSource: 'desktop',
+              chromeMediaSourceId: src.id,
+              minWidth: src.width || 640,
+              minHeight: src.height || 480,
+              maxWidth: src.width || 8192,
+              maxHeight: src.height || 8192,
+              maxFrameRate: fps,
+            },
+          },
+        }) as Promise<MediaStream>;
+      }
       // Never let a wedged capture hold the shared lock forever — bound it so a
       // failed screen surfaces an error and lets the next screen proceed.
       stream = await Promise.race([
@@ -514,6 +567,12 @@ class HostEngine {
         new Promise<MediaStream>((_, rej) =>
           setTimeout(() => rej(new Error('capture timed out')), 12000)),
       ]);
+      // getDisplayMedia may report logical rather than physical pixels — trust
+      // the track's real height so scaleResolutionDownBy / cursor sizing stay right.
+      if (suppressCursor) {
+        const st = stream.getVideoTracks()[0]?.getSettings();
+        if (st?.height) captureHeight = st.height;
+      }
     } catch (err: any) {
       console.error('display capture failed', err);
       warp.toSession(sessionId, {
@@ -547,7 +606,7 @@ class HostEngine {
     });
     const session: HostSession = {
       pc, stream, channel: null, fastChannel: null, displayId, sender: null, track,
-      captureHeight, reqBitrate: Number(msg.bitrate) || 150,
+      captureHeight, scaleFactor, reqBitrate: Number(msg.bitrate) || 150,
       audioStream: audioCapture, micPlayer: null,
       adaptCapMbps: Number(msg.bitrate) || 150,
       lossEwma: 0, rttEwma: 0, rttBaseMs: 1e9,
@@ -566,6 +625,13 @@ class HostEngine {
     const channel = pc.createDataChannel('warp', { ordered: true });
     session.channel = channel;
     channel.onmessage = (e) => this.onChannelMessage(sessionId, e.data);
+    // Send the current cursor to this screen the moment its channel opens, so a
+    // freshly-connected viewer shows the right cursor immediately (not only after
+    // the next shape change). Harmless when suppression is off (no cursor data).
+    channel.onopen = () => {
+      if (this.lastCursor) this.sendCursorToSession(session, this.lastCursor);
+      else warp.requestCursorSnapshot();
+    };
 
     const fastChannel = pc.createDataChannel('warp-fast', {
       ordered: false, maxRetransmits: 0,

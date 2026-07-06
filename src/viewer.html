@@ -19,6 +19,17 @@
       display: block;
     }
 
+    /* Locally-rendered host cursor: GPU-composited, above the video, never
+       intercepts input, positioned each frame from JS via transform. */
+    #cursor {
+      position: fixed; left: 0; top: 0;
+      pointer-events: none;
+      display: none;
+      will-change: transform;
+      image-rendering: -webkit-optimize-contrast;
+      z-index: 8;
+    }
+
     /* status / reconnect layer */
     .status {
       position: fixed; inset: 0;
@@ -140,6 +151,9 @@
 </head>
 <body>
   <video id="video" autoplay muted playsinline></video>
+  <!-- Locally-rendered host cursor (shown only when the host suppresses the
+       video cursor); positioned via JS transform each animation frame. -->
+  <img id="cursor" alt="" />
 
   <div class="hotzone"></div>
   <div class="overlay" id="overlay">

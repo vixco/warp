@@ -27,6 +27,8 @@ const P = {
   maxHeight: params.get('maxHeight') != null ? Number(params.get('maxHeight')) : 1440,
   label: params.get('label') || 'Warp',
   screenIndex: Number(params.get('screenIndex')) || 0,
+  // Host suppressed the OS cursor in the video → we render our own local cursor.
+  clientCursor: params.get('clientCursor') === '1',
 };
 // Audio passthrough rides on the first screen only (one audio path, not three)
 const WANT_AUDIO = P.screenIndex === 0;
@@ -190,6 +192,7 @@ async function acceptOffer(sdp: string) {
       try {
         const msg = JSON.parse(String(ev.data));
         if (msg.t === 'clip') window.warp.setClipboard(msg.s);
+        else if (msg.t === 'cur') applyCursor(msg);
       } catch { /* ignore */ }
     };
   };
@@ -832,6 +835,64 @@ function flashOverlay() {
     overlayShown = false;
     if (!menuOpen) overlay.classList.remove('show');
   }, 2600);
+}
+
+// ---------------------------------------------------------------------------
+// Local cursor (Parsec-style): when the host suppressed the OS cursor in the
+// video, render the host's ACTUAL cursor image at OUR pointer position, redrawn
+// every animation frame — so the pointer tracks the monitor's full refresh rate,
+// decoupled from the ~60 fps video. Only the cursor image + hotspot is streamed
+// (reliable channel, on shape change); placement is 100% local.
+const cursorEl = document.getElementById('cursor') as HTMLImageElement | null;
+let curX = 0, curY = 0;
+let curFracH = 0.03, curAspect = 0.6, curHotX = 0, curHotY = 0;
+let curHidden = false, curReady = false;
+
+function applyCursor(m: any) {
+  if (!P.clientCursor || !cursorEl) return;
+  if (m.hidden) { curHidden = true; return; }
+  curHidden = false;
+  if (m.png) { cursorEl.src = 'data:image/png;base64,' + m.png; curReady = true; }
+  if (typeof m.fracH === 'number' && m.fracH > 0) curFracH = m.fracH;
+  if (typeof m.aspect === 'number' && m.aspect > 0) curAspect = m.aspect;
+  if (typeof m.hotFracX === 'number') curHotX = m.hotFracX;
+  if (typeof m.hotFracY === 'number') curHotY = m.hotFracY;
+}
+
+if (P.clientCursor && cursorEl) {
+  // Default arrow so a cursor is always visible — even before the host's first
+  // image, or if the cursor helper is unavailable (the video cursor is hidden,
+  // so without this the pointer would vanish). Replaced by the exact host cursor
+  // the moment it arrives. Hotspot at the tip (0,0).
+  cursorEl.src = 'data:image/svg+xml,' + encodeURIComponent(
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 12 19">' +
+    '<path d="M0 0 L0 16 L4 12 L7 18 L9 17 L6 11 L11 11 Z" ' +
+    'fill="#fff" stroke="#000" stroke-width="1.2" stroke-linejoin="round"/></svg>');
+  curReady = true; curAspect = 12 / 19; curFracH = 0.032; curHotX = 0; curHotY = 0;
+  window.addEventListener('pointermove', (e) => { curX = e.clientX; curY = e.clientY; }, { passive: true });
+  const tickCursor = () => {
+    requestAnimationFrame(tickCursor);
+    const vw = video.videoWidth, vh = video.videoHeight;
+    // Hidden over the menu/overlay (real OS cursor is shown there for the
+    // controls), when the host app hid the cursor, before the first image, or
+    // when the pointer is off the picture (letterbox bars / other monitor).
+    if (!curReady || curHidden || menuOpen || overlayShown || !vw || !vh) {
+      cursorEl.style.display = 'none'; return;
+    }
+    const ew = video.clientWidth, eh = video.clientHeight;
+    const scale = Math.min(ew / vw, eh / vh);
+    const dw = vw * scale, dh = vh * scale;
+    const ox = (ew - dw) / 2, oy = (eh - dh) / 2;
+    if (curX < ox || curX > ox + dw || curY < oy || curY > oy + dh) {
+      cursorEl.style.display = 'none'; return;
+    }
+    const h = curFracH * dh, w = h * curAspect;
+    cursorEl.style.width = `${w}px`;
+    cursorEl.style.height = `${h}px`;
+    cursorEl.style.transform = `translate3d(${curX - curHotX * w}px, ${curY - curHotY * h}px, 0)`;
+    cursorEl.style.display = 'block';
+  };
+  requestAnimationFrame(tickCursor);
 }
 
 // If the chosen codec can't be hardware-decoded on this machine, fall back to

@@ -91,6 +91,10 @@ class LineProcess {
 export class NativeHelpers {
   private input = new LineProcess('warp-input');
   private vdisplay = new LineProcess('warp-vdisplay');
+  private cursor = new LineProcess('warp-cursor');
+  // Called with each {t:'cur',...} the cursor helper emits (image + hotspot, or
+  // hidden). Wired by main so it can forward the update to the host renderer.
+  onCursor: ((msg: any) => void) | null = null;
   private caffeinate: ReturnType<typeof spawn> | null = null;
   private hosting = false;
   // Backoff so a broken caffeinate binary can't spin a respawn loop. Reset to 0
@@ -134,10 +138,21 @@ export class NativeHelpers {
     });
   }
 
+  // The cursor helper is only needed while the client renders its own cursor
+  // (i.e. when the video cursor is suppressed). Start/stop it on demand.
+  startCursor() {
+    if (process.platform !== 'darwin') return;
+    this.cursor.onEvent = (m) => { if (m && m.t === 'cur') this.onCursor?.(m); };
+    this.cursor.start();
+  }
+  stopCursor() { this.cursor.stop(); }
+  requestCursorSnapshot() { if (this.cursor.running) this.cursor.write({ cmd: 'snapshot' }); }
+
   stopHosting() {
     this.hosting = false;
     this.input.write({ t: 'reset' });
     this.input.stop();
+    this.cursor.stop();
     this.vdisplay.stop(); // tears down all virtual displays
     if (this.caffeinateTimer) { clearTimeout(this.caffeinateTimer); this.caffeinateTimer = null; }
     if (this.caffeinate) { this.caffeinate.kill(); this.caffeinate = null; }

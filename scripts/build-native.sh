@@ -19,4 +19,8 @@ clang -fobjc-arc -O2 \
   -framework Foundation -framework CoreGraphics \
   -o native/bin/warp-vdisplay native/mac/warp-vdisplay.m
 
-echo "build-native: ok -> native/bin/{warp-input,warp-vdisplay}"
+clang -fobjc-arc -O2 \
+  -framework Cocoa -framework CoreGraphics \
+  -o native/bin/warp-cursor native/mac/warp-cursor.m
+
+echo "build-native: ok -> native/bin/{warp-input,warp-vdisplay,warp-cursor}"
