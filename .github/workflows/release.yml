@@ -102,31 +102,72 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   # Flip the draft to a public "Latest" release only after both platforms have
-  # uploaded their artifacts, so latest.yml is guaranteed present before any
-  # client sees the release. Also stamp the macOS install note into the body:
-  # without an Apple Developer ID the build is only ad-hoc signed, so macOS
-  # Gatekeeper quarantines the browser download and shows "Warp is damaged"
-  # until the user strips the quarantine flag once.
+  # uploaded their artifacts, so latest.yml / latest-mac.yml are guaranteed
+  # present before any client sees the release.
+  #
+  # electron-builder can RACE while uploading a job's several artifacts and
+  # create a second, incomplete release for the same tag (one release ends up
+  # with all installers + update manifests, the other with a single stray file).
+  # Which of the two GitHub then treats as "Latest" is nondeterministic, so
+  # `gh release edit <tag>` sometimes published the empty duplicate — leaving
+  # clients with "Cannot find latest-mac.yml in the latest release artifacts".
+  # So instead of editing by tag, we resolve the tag to the COMPLETE release
+  # (the one carrying the most assets), delete any incomplete duplicates, and
+  # publish that one as the single public Latest.
+  #
+  # The body also carries the macOS install note: without an Apple Developer ID
+  # the build is only ad-hoc signed, so macOS Gatekeeper quarantines the browser
+  # download and shows "Warp is damaged" until the user strips the quarantine
+  # flag once.
   publish:
     runs-on: ubuntu-latest
     needs: [mac, windows]
     steps:
-      - name: Publish with install notes
-        run: |
-          gh release edit "v$APP_VERSION" --repo vixco/warp --draft=false --latest --notes '## Install
-
-          ### macOS
-
-          The build is ad-hoc signed (no Apple Developer ID), so macOS Gatekeeper quarantines the browser download and may show **“Warp is damaged”**. Clear the quarantine flag once **before** opening the dmg:
-
-          ```sh
-          xattr -cr ~/Downloads/Warp-*-arm64.dmg
-          ```
-
-          Then open the dmg, drag Warp to Applications, and launch.
-
-          ### Windows
-
-          Run the `Warp-Setup-*.exe` installer — it opens without a signature warning.'
+      - name: Publish the complete release, retire duplicates
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: vixco/warp
+          NOTES: |
+            ## Install
+
+            ### macOS
+
+            The build is ad-hoc signed (no Apple Developer ID), so macOS Gatekeeper quarantines the browser download and may show **“Warp is damaged”**. Clear the quarantine flag once **before** opening the dmg:
+
+            ```sh
+            xattr -cr ~/Downloads/Warp-*-arm64.dmg
+            ```
+
+            Then open the dmg, drag Warp to Applications, and launch.
+
+            ### Windows
+
+            Run the `Warp-Setup-*.exe` installer — it opens without a signature warning.
+        run: |
+          set -euo pipefail
+          TAG="v$APP_VERSION"
+          # Every release GitHub currently holds for this tag, newest first.
+          # (No --paginate: a tag only ever has 1-2 releases and they sort to the
+          # top of page 1, so per-page jq stays correct.)
+          ids=$(gh api "repos/$REPO/releases" \
+            --jq "[.[] | select(.tag_name==\"$TAG\")] | sort_by(.assets|length) | reverse | .[].id")
+          if [ -z "$ids" ]; then echo "::error::no release found for $TAG"; exit 1; fi
+          # The complete release carries the most assets (installers + manifests);
+          # anything else for this tag is an incomplete race duplicate.
+          good=$(echo "$ids" | head -n1)
+          for id in $ids; do
+            if [ "$id" != "$good" ]; then
+              echo "Deleting incomplete duplicate release $id for $TAG"
+              gh api -X DELETE "repos/$REPO/releases/$id"
+            fi
+          done
+          # Guard: the winner must actually carry the mac update manifest, else
+          # publishing it would ship the same broken "no latest-mac.yml" state.
+          has_yml=$(gh api "repos/$REPO/releases/$good" \
+            --jq '[.assets[].name] | any(. == "latest-mac.yml")')
+          if [ "$has_yml" != "true" ]; then
+            echo "::error::release $good for $TAG is missing latest-mac.yml"; exit 1
+          fi
+          gh api -X PATCH "repos/$REPO/releases/$good" \
+            -F draft=false -f make_latest=true -f body="$NOTES" >/dev/null
+          echo "Published release $good as the Latest for $TAG"
