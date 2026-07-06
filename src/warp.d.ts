@@ -26,6 +26,8 @@ export interface WarpApi {
   viewerClose(): void;
   viewerCloseAll(): void;
   viewerToggleFullscreen(): void;
+  viewerApplyAll(cfg: any): void;
+  onApplyCfg(fn: (cfg: any) => void): void;
   openPermissionSettings(which: string): Promise<void>;
   requestScreenPermission(): Promise<any>;
   createVdisplay(width: number, height: number, hz?: number): Promise<any>;

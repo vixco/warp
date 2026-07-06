@@ -92,6 +92,7 @@ interface Settings {
   trustedClients: string[]; // clientIds that paired before and skip the code
   fps: number;
   maxBitrateMbps: number;
+  maxHeight: number;        // encode-height cap shared by every screen (0 = native)
   codec: 'h264' | 'hevc' | 'vp9' | 'av1';
   hidpiVirtual: boolean;
   hostingEnabled: boolean;
@@ -118,6 +119,7 @@ function loadSettings(): Settings {
     // oscillation that reads as periodic lag spikes. 100 is still overkill-sharp
     // for 1440p desktop and much steadier; raise it in the menu on a wired LAN.
     maxBitrateMbps: 100,
+    maxHeight: 1440,
     codec: 'h264',
     hidpiVirtual: false,
     hostingEnabled: false,
@@ -576,7 +578,7 @@ function closeAllViewers() {
 function openViewerWindow(opts: {
   sessionId: string; host: string; port: number; code: string; clientId: string;
   displayId: number; screenIndex: number; targetDisplayId?: number;
-  fps: number; bitrateMbps: number; codec: string; mode: string; label: string;
+  fps: number; bitrateMbps: number; maxHeight: number; codec: string; mode: string; label: string;
   screenMap?: string;
 }) {
   const target = screen.getAllDisplays().find((d) => d.id === opts.targetDisplayId)
@@ -609,6 +611,7 @@ function openViewerWindow(opts: {
     screenIndex: String(opts.screenIndex),
     fps: String(opts.fps),
     bitrate: String(opts.bitrateMbps),
+    maxHeight: String(opts.maxHeight),
     codec: opts.codec,
     mode: opts.mode,
     label: opts.label,
@@ -720,7 +723,10 @@ function wireIpc() {
         // Per-monitor frame rate chosen in the mapping dialog; falls back to
         // the global default when a screen didn't specify one.
         fps: s.fps || settings.fps,
+        // Quality settings are global (shared by every screen) and persisted, so
+        // an in-stream tweak on one screen is what all screens start from too.
         bitrateMbps: settings.maxBitrateMbps,
+        maxHeight: settings.maxHeight,
         codec: settings.codec,
         mode: settings.streamMode,
         label: s.label,
@@ -728,6 +734,27 @@ function wireIpc() {
       });
     });
     return true;
+  });
+
+  // One viewer changed a stream setting in its in-stream menu: persist it as the
+  // new global default AND push it to every open viewer, so the setting applies
+  // to all screens at once and is restored on the next connect. Fields are
+  // optional; only those present in the patch change.
+  ipcMain.on('viewer-apply-all', (_e, cfg: {
+    bitrate?: number; fps?: number; mode?: string; maxHeight?: number; codec?: string;
+  }) => {
+    if (!cfg || typeof cfg !== 'object') return;
+    if (cfg.bitrate != null) settings.maxBitrateMbps = Number(cfg.bitrate) || settings.maxBitrateMbps;
+    if (cfg.fps != null) settings.fps = Number(cfg.fps) || settings.fps;
+    if (cfg.mode != null) settings.streamMode = cfg.mode === 'smooth' ? 'smooth' : 'sharp';
+    if (cfg.maxHeight != null) settings.maxHeight = Number(cfg.maxHeight);
+    if (cfg.codec != null && ['h264', 'hevc', 'vp9', 'av1'].includes(cfg.codec)) {
+      settings.codec = cfg.codec as Settings['codec'];
+    }
+    saveSettings();
+    for (const win of viewerWindows.values()) {
+      if (!win.isDestroyed()) win.webContents.send('apply-cfg', cfg);
+    }
   });
 
   ipcMain.on('viewer-close', (e) => {

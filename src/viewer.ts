@@ -617,33 +617,52 @@ document.getElementById('menuMic')!.addEventListener('change', async (e) => {
   await attachMic();
 });
 
-function sendCfg() {
-  // Persist the live choices onto P so a codec switch (which reconnects) keeps
-  // the latest settings instead of snapping back to connect-time values.
-  P.bitrate = Number(menuBitrate.value);
-  P.fps = Number(menuFps.value);
-  P.mode = menuMode.value;
-  P.maxHeight = Number(menuRes.value);
-  sendInput({ t: 'cfg', bitrate: P.bitrate, fps: P.fps, mode: P.mode, maxHeight: P.maxHeight });
-  // Picture mode / fps changed the buffer target — re-apply it live so switching
-  // to "Smooth motion" starts smoothing immediately (no reconnect needed).
-  pc?.getReceivers().forEach(applyReceiverLatency);
+// Menu changes don't apply only to this screen: they go through the main process
+// which persists them as the global default AND fans them out to EVERY open
+// viewer, so one tweak changes all screens and is remembered next connect. The
+// broadcast comes back to this window too (via onApplyCfg), which is where the
+// change is actually applied — so behaviour is identical on the screen you
+// touched and the others.
+function broadcastMenuCfg() {
+  window.warp.viewerApplyAll({
+    bitrate: Number(menuBitrate.value),
+    fps: Number(menuFps.value),
+    mode: menuMode.value,
+    maxHeight: Number(menuRes.value),
+  });
 }
-menuBitrate.addEventListener('change', sendCfg);
-menuFps.addEventListener('change', sendCfg);
-menuMode.addEventListener('change', sendCfg);
-menuRes.addEventListener('change', sendCfg);
+menuBitrate.addEventListener('change', broadcastMenuCfg);
+menuFps.addEventListener('change', broadcastMenuCfg);
+menuMode.addEventListener('change', broadcastMenuCfg);
+menuRes.addEventListener('change', broadcastMenuCfg);
 
-// Switching codec means renegotiating the encoder, so we reconnect this screen
-// with the new codec (bitrate/fps/mode carry over via P). Quick and reliable —
-// a brief black flash, then the stream comes back on the chosen encoder.
+// Switching codec renegotiates the encoder, so it reconnects — broadcast it so
+// every screen switches codec together.
 menuCodec.addEventListener('change', () => {
-  const next = menuCodec.value;
-  if (next === P.codec) return;
-  P.codec = next;
+  if (menuCodec.value === P.codec) return;
   toggleMenu(false);
-  showStatus(`Switching to ${next.toUpperCase()}…`);
-  connect();
+  window.warp.viewerApplyAll({ codec: menuCodec.value });
+});
+
+// Apply a settings patch to THIS screen (received from the broadcast, so every
+// viewer applies it identically). Updates the menu, the live stream, and — for a
+// codec change — reconnects. Never re-broadcasts, so there is no loop.
+window.warp.onApplyCfg((cfg: any) => {
+  if (cfg.bitrate != null) { P.bitrate = Number(cfg.bitrate); menuBitrate.value = String(P.bitrate); }
+  if (cfg.fps != null) { P.fps = Number(cfg.fps); if ([...menuFps.options].some((o) => o.value === String(P.fps))) menuFps.value = String(P.fps); }
+  if (cfg.mode != null) { P.mode = cfg.mode; menuMode.value = P.mode; }
+  if (cfg.maxHeight != null) { P.maxHeight = Number(cfg.maxHeight); menuRes.value = String(P.maxHeight); }
+  if (cfg.bitrate != null || cfg.fps != null || cfg.mode != null || cfg.maxHeight != null) {
+    sendInput({ t: 'cfg', bitrate: P.bitrate, fps: P.fps, mode: P.mode, maxHeight: P.maxHeight });
+    // Picture mode / fps changed the buffer target — re-apply it live.
+    pc?.getReceivers().forEach(applyReceiverLatency);
+  }
+  if (cfg.codec != null && cfg.codec !== P.codec) {
+    P.codec = cfg.codec;
+    if ([...menuCodec.options].some((o) => o.value === P.codec)) menuCodec.value = P.codec;
+    showStatus(`Switching to ${String(P.codec).toUpperCase()}…`);
+    connect();
+  }
 });
 
 document.getElementById('menuFullscreen')!.addEventListener('click', () =>

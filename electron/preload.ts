@@ -43,6 +43,10 @@ contextBridge.exposeInMainWorld('warp', {
   viewerClose: () => ipcRenderer.send('viewer-close'),
   viewerCloseAll: () => ipcRenderer.send('viewer-close-all'),
   viewerToggleFullscreen: () => ipcRenderer.send('viewer-toggle-fullscreen'),
+  // apply a stream-setting change to every open viewer + persist it globally
+  viewerApplyAll: (cfg: any) => ipcRenderer.send('viewer-apply-all', cfg),
+  onApplyCfg: (fn: (cfg: any) => void) =>
+    ipcRenderer.on('apply-cfg', (_e, cfg) => fn(cfg)),
 
   // permissions
   openPermissionSettings: (which: string) =>
