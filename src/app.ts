@@ -247,6 +247,13 @@ interface HostSession {
   coolTicks: number;      // ticks left blocking a further cut after a cut
   qlBwTicks: number;      // consecutive 'bandwidth' quality-limitation ticks
   lastBytesSent: number; lastStatTs: number;
+  // Adaptive-resolution state — a coarse height tier with its own long hysteresis,
+  // layered on top of the (fine, fast) bitrate loop above.
+  userMaxHeight: number;  // the configured ceiling (0 = native); adaptation never exceeds it
+  resTiers: number[];     // ascending reachable height caps for this session (top = ceiling)
+  resTierIdx: number;     // index into resTiers → applied cap = resTiers[resTierIdx]
+  resUpTicks: number;     // consecutive clean+headroom ticks (gate for a tier up)
+  resHoldTicks: number;   // ticks left blocking a raise after a forced tier down
 }
 
 // Adaptive-quality (AIMD) tuning. The controller keeps the send bitrate just
@@ -267,6 +274,19 @@ const DOWN_COOLDOWN_TICKS = 2;    // after a cut, block further cuts (let RR cat
 const UP_HOLD_TICKS = 8;          // after a cut, block raises (don't re-probe the loss)
 const QL_BW_TICKS = 2;            // debounce 'bandwidth' quality-limitation
 const RTT_INFLATE_MS = 30;        // RTT rise over baseline that signals bufferbloat
+
+// Adaptive-resolution (coarse) tuning. Resolution is the single biggest latency
+// lever on a high-DPI host, so unlike bitrate we START conservative on an
+// unproven link (RES_SAFE_START) and only climb toward the user's configured
+// ceiling once the link has PROVEN sustained clean headroom — and shed a tier
+// when even a hard bitrate cut can't clear the loss (pixels, not bytes, are the
+// problem). A resolution switch is coarse and visible, so the hysteresis here is
+// deliberately far longer/stickier than the bitrate loop's.
+const RES_LADDER = [1080, 1440, 2160]; // ascending height tiers; 0 (native) sits above
+const RES_FLOOR = 1080;                // never auto-drop below this
+const RES_SAFE_START = 1440;           // where a fresh, unproven session begins
+const RES_UP_TICKS = 12;               // sustained clean+headroom ticks before a tier up
+const RES_HOLD_TICKS = 15;             // block a re-raise this long after a forced tier down
 
 class HostEngine {
   sessions = new Map<string, HostSession>();
@@ -310,6 +330,38 @@ class HostEngine {
     const share = this.perStreamBitrateMbps(s);
     const cap = s.adaptCapMbps ?? share;
     return Math.max(HostEngine.PER_STREAM_FLOOR_MBPS, Math.min(share, Math.round(cap)));
+  }
+
+  // Build the ascending list of height caps a session may use: every ladder tier
+  // from the floor up to (and including) the user's ceiling, plus native (0) when
+  // the user allows it. adaptation walks this list and never steps past the top.
+  private buildResTiers(userMax: number): number[] {
+    const tiers = RES_LADDER.filter((h) => h >= RES_FLOOR && (userMax === 0 || h <= userMax));
+    if (userMax === 0) tiers.push(0); // native sits above the ladder
+    return tiers.length ? tiers : [userMax || 0];
+  }
+
+  // Whether coarse resolution adaptation is worth running. Only on a host taller
+  // than the safe-start tier whose ceiling is above it too: on a <=1440p host, or
+  // when the user pinned the cap at/below the safe start, scaleFor() is 1 at every
+  // reachable tier, so stepping would only churn keyframes for no extra pixels.
+  private resAdaptable(s: HostSession): boolean {
+    return s.captureHeight > RES_SAFE_START &&
+      (s.userMaxHeight === 0 || s.userMaxHeight > RES_SAFE_START);
+  }
+
+  // The height cap currently applied to the encoder (0 = native).
+  private effectiveHeight(s: HostSession): number {
+    return s.resTiers[s.resTierIdx] ?? s.userMaxHeight;
+  }
+
+  // Move the resolution one tier toward the ceiling (+1) or the floor (-1).
+  // Returns true only when the applied cap actually changed.
+  private stepHeight(s: HostSession, dir: 1 | -1): boolean {
+    const next = Math.max(0, Math.min(s.resTiers.length - 1, s.resTierIdx + dir));
+    if (next === s.resTierIdx) return false;
+    s.resTierIdx = next;
+    return true;
   }
 
   // Re-apply each live screen's shared bitrate ceiling. Called whenever the set
@@ -413,6 +465,35 @@ class HostEngine {
       s.stableTicks = 0;
       await this.applyEffective(s);
     }
+
+    // --- Adaptive resolution: a coarse, slow, well-damped tier layered on top of
+    // the bitrate loop above. DOWN only when the bitrate loop has ALREADY cut hard
+    // and the link is still lossy (fewer pixels now, so the bytes we CAN send land
+    // clean); UP only when clean AND GCC's own estimate shows real spare capacity
+    // to spend on a sharper, heavier encode. A no-op on a <=1440p host. ---
+    if (this.resAdaptable(s)) {
+      if (s.resHoldTicks > 0) s.resHoldTicks--;
+      const bitrateStarved = s.adaptCapMbps < 0.6 * share;
+      const stillBad = s.lossEwma > LOSS_HIGH || s.qlBwTicks >= QL_BW_TICKS;
+      if (bitrateStarved && stillBad && s.resHoldTicks === 0 && this.stepHeight(s, -1)) {
+        s.resUpTicks = 0; s.resHoldTicks = RES_HOLD_TICKS;
+        await this.applyEffective(s);
+      } else {
+        const resClean = s.lossEwma < LOSS_LOW && qlr !== 'bandwidth' &&
+          (rttMs < 0 || s.rttEwma <= s.rttBaseMs + RTT_INFLATE_MS);
+        // GCC's link estimate must sit comfortably above what we send (room for the
+        // higher-bitrate encode a sharper picture needs) and the bitrate loop must
+        // not itself be throttling (adaptCap pinned at the full share).
+        const headroom = availMbps >= 0 &&
+          (availMbps >= share || availMbps > 1.3 * Math.max(sendMbps, HostEngine.PER_STREAM_FLOOR_MBPS));
+        if (resClean && headroom && s.adaptCapMbps >= share && s.holdTicks === 0) s.resUpTicks++;
+        else s.resUpTicks = 0;
+        if (s.resUpTicks >= RES_UP_TICKS) {
+          s.resUpTicks = 0;
+          if (this.stepHeight(s, +1)) await this.applyEffective(s);
+        }
+      }
+    }
   }
 
   private async applyEffective(s: HostSession) {
@@ -421,6 +502,9 @@ class HostEngine {
       const p = s.sender.getParameters();
       p.encodings = p.encodings?.length ? p.encodings : [{}];
       p.encodings[0].maxBitrate = this.effectiveBitrateMbps(s) * 1_000_000;
+      // Reflect the current adaptive height too — unchanged on a pure bitrate step
+      // (WebRTC treats an identical scale as a no-op), applied when a tier moved.
+      p.encodings[0].scaleResolutionDownBy = scaleFor(s.captureHeight, this.effectiveHeight(s));
       await s.sender.setParameters(p);
     } catch { /* transient renegotiation; next tick fixes it */ }
   }
@@ -613,9 +697,22 @@ class HostEngine {
       lossEwma: 0, rttEwma: 0, rttBaseMs: 1e9,
       stableTicks: 0, holdTicks: 0, coolTicks: 0, qlBwTicks: 0,
       lastBytesSent: 0, lastStatTs: 0,
+      userMaxHeight: Number(msg.maxHeight) || 0,
+      resTiers: [], resTierIdx: 0, resUpTicks: 0, resHoldTicks: 0,
     };
     this.sessions.set(sessionId, session);
     session.adaptCapMbps = this.perStreamBitrateMbps(session); // start at the full share → no-op
+
+    // Resolution starts CONSERVATIVE on an unproven link: a fresh session begins
+    // at the safe-start tier (or the ceiling, whichever is lower) and the adapt
+    // loop proves up toward the user's ceiling from there. On a <=1440p host, or a
+    // cap pinned at/below the safe start, there's nothing to prove — sit at the cap.
+    session.resTiers = this.buildResTiers(session.userMaxHeight);
+    const startH = this.resAdaptable(session)
+      ? Math.min(RES_SAFE_START, session.userMaxHeight || RES_SAFE_START)
+      : (session.userMaxHeight || 0);
+    const startIdx = session.resTiers.indexOf(startH);
+    session.resTierIdx = startIdx >= 0 ? startIdx : session.resTiers.length - 1;
 
     // Two data channels so continuous mouse movement never gets stuck behind a
     // video retransmit:
@@ -685,7 +782,8 @@ class HostEngine {
 
     const mbps = Number(msg.bitrate) || 150;
     const mode = msg.mode === 'smooth' ? 'smooth' : 'sharp';
-    const maxHeight = Number(msg.maxHeight) || 0; // 0 = native, else cap encode height
+    // The encode-height cap (0 = native) lives on the session as userMaxHeight and
+    // is applied via the adaptive controller (effectiveHeight), not directly here.
 
     const offer = await pc.createOffer();
     // Tune the encoder's bitrate envelope in the SDP (see tuneVideoSdp): high
@@ -708,7 +806,9 @@ class HostEngine {
         params.encodings = params.encodings?.length ? params.encodings : [{}];
         params.encodings[0].maxBitrate = this.effectiveBitrateMbps(session) * 1_000_000;
         params.encodings[0].maxFramerate = fps;
-        params.encodings[0].scaleResolutionDownBy = scaleFor(captureHeight, maxHeight);
+        // Start at the adaptive safe-start height, not the raw ceiling — the loop
+        // climbs toward `maxHeight` only once the link proves it can carry it.
+        params.encodings[0].scaleResolutionDownBy = scaleFor(captureHeight, this.effectiveHeight(session));
         (params.encodings[0] as any).priority = 'high';
         (params.encodings[0] as any).networkPriority = 'high';
         (params as any).degradationPreference = degradationFor(mode);
@@ -810,10 +910,18 @@ class HostEngine {
           params.encodings[0].maxFramerate = Math.min(Number(cfg.fps), MAX_CAPTURE_FPS);
         }
         // Live resolution cap: fewer pixels to encode/transmit/decode is the
-        // biggest latency lever on a high-DPI host.
+        // biggest latency lever on a high-DPI host. An explicit menu pick is
+        // honoured immediately AND becomes the new adaptive ceiling — rebuild the
+        // tier ladder around it and jump straight to it (they asked for it), while
+        // leaving the adapt loop free to shed a tier later if the link can't hold
+        // it. Clearing the res history avoids an instant re-drop on stale loss.
         if (cfg.maxHeight !== undefined) {
+          s.userMaxHeight = Number(cfg.maxHeight) || 0;
+          s.resTiers = this.buildResTiers(s.userMaxHeight);
+          s.resTierIdx = s.resTiers.length - 1; // top of the ladder = the cap they picked
+          s.resUpTicks = 0; s.resHoldTicks = 0;
           params.encodings[0].scaleResolutionDownBy =
-            scaleFor(s.captureHeight, Number(cfg.maxHeight) || 0);
+            scaleFor(s.captureHeight, this.effectiveHeight(s));
         }
         // Keep the sacrifice-order aligned with the live picture-mode switch.
         if (cfg.mode) (params as any).degradationPreference = degradationFor(cfg.mode);
@@ -915,13 +1023,14 @@ function scaleFor(captureHeight: number, maxHeight: number): number {
 
 // Under network/CPU constraint, decide what to sacrifice first. 'smooth'
 // (gaming/video) holds the frame rate and lets resolution soften. 'sharp'
-// (desktop/text) now uses 'maintain-resolution': the whole point of the sharp
-// preset is a crisp picture, so a transient hiccup should cost a few frames of
-// smoothness, never the resolution — softening the image is exactly what the
-// user picked this mode to avoid. On a wired LAN (the target) real constraint
-// is rare anyway, so this almost never engages; when it does, text stays sharp.
-function degradationFor(mode: string): 'maintain-resolution' | 'maintain-framerate' {
-  return mode === 'smooth' ? 'maintain-framerate' : 'maintain-resolution';
+// (desktop/text) uses 'balanced': the coarse adaptive-resolution controller owns
+// the *sustained* resolution ceiling (see adaptTick), and 'balanced' lets WebRTC
+// shed a little of both resolution and frame rate for the fast *transient* — so a
+// WiFi hiccup recovers in a frame or two instead of stalling on full-resolution
+// frames, which is what reads as a lag spike. The two layer cleanly: the slow
+// outer loop picks the ceiling, the fast inner loop protects latency below it.
+function degradationFor(mode: string): 'balanced' | 'maintain-framerate' {
+  return mode === 'smooth' ? 'maintain-framerate' : 'balanced';
 }
 
 // Widen the video encoder's bitrate envelope directly in the offer SDP. This
