@@ -759,7 +759,7 @@ class HostEngine {
     this.incomingBlobs.delete(msg.id);
     const dataUrl = b.parts.join('');
     if (b.kind === 'img') {
-      this.lastImgSig = blobSig(dataUrl);
+      this.lastImgSig = hostBlobSig(dataUrl);
       warp.setClipboardImage(dataUrl);
     } else if (b.kind === 'file') {
       warp.saveIncomingFile(b.name || 'warp-file', dataUrl).then((res) => {
@@ -774,10 +774,10 @@ class HostEngine {
     if (this.sessions.size === 0) return;
     try {
       const d = await warp.getClipboardImage();
-      if (d && blobSig(d) !== this.lastImgSig) {
-        this.lastImgSig = blobSig(d);
+      if (d && hostBlobSig(d) !== this.lastImgSig) {
+        this.lastImgSig = hostBlobSig(d);
         for (const s of this.sessions.values()) {
-          if (s.channel?.readyState === 'open') sendBlob(s.channel, 'img', d);
+          if (s.channel?.readyState === 'open') hostSendBlob(s.channel, 'img', d);
         }
       }
     } catch { /* ignore */ }
@@ -884,22 +884,22 @@ async function findVirtualAudioDevice(): Promise<string | null> {
 // Cheap signature of a data-URL for change detection / echo suppression — full
 // content compare would be costly for a large image, and length + tail is a
 // reliable enough fingerprint for clipboard use.
-function blobSig(d: string): string { return d.length + '|' + d.slice(-256); }
+function hostBlobSig(d: string): string { return d.length + '|' + d.slice(-256); }
 
 // Chunked send of a data-URL over a reliable data channel (clipboard image /
 // file). Base64 chunks ride the existing JSON message routing; backpressure via
 // bufferedAmount keeps a big file from overflowing the send buffer.
-const BLOB_CHUNK = 48 * 1024;
-const MAX_BLOB_CHARS = 44 * 1024 * 1024; // ~32MB after base64 expansion
-async function sendBlob(ch: RTCDataChannel, kind: string, dataUrl: string, extra: Record<string, any> = {}) {
-  if (ch.readyState !== 'open' || dataUrl.length > MAX_BLOB_CHARS) return;
+const HOST_BLOB_CHUNK = 48 * 1024;
+const HOST_MAX_BLOB_CHARS = 44 * 1024 * 1024; // ~32MB after base64 expansion
+async function hostSendBlob(ch: RTCDataChannel, kind: string, dataUrl: string, extra: Record<string, any> = {}) {
+  if (ch.readyState !== 'open' || dataUrl.length > HOST_MAX_BLOB_CHARS) return;
   const id = 'b' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
-  const total = Math.ceil(dataUrl.length / BLOB_CHUNK);
+  const total = Math.ceil(dataUrl.length / HOST_BLOB_CHUNK);
   ch.send(JSON.stringify({ t: 'blob', id, kind, total, ...extra }));
   for (let i = 0; i < total; i++) {
     while (ch.bufferedAmount > 8 * 1024 * 1024) await new Promise((r) => setTimeout(r, 20));
     if (ch.readyState !== 'open') return;
-    ch.send(JSON.stringify({ t: 'blobc', id, seq: i, d: dataUrl.slice(i * BLOB_CHUNK, (i + 1) * BLOB_CHUNK) }));
+    ch.send(JSON.stringify({ t: 'blobc', id, seq: i, d: dataUrl.slice(i * HOST_BLOB_CHUNK, (i + 1) * HOST_BLOB_CHUNK) }));
   }
 }
 
