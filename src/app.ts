@@ -340,23 +340,14 @@ class HostEngine {
     const useLoopback = wantAudio && hostSettings.audioEnabled !== false &&
       audioSource === 'auto';
 
-    // Capture DIRECTLY at the encode target, not at full native resolution.
-    // Previously we captured the display's physical pixels (5K/4K on Retina) and
-    // let the encoder downscale to maxHeight — which means every frame is hauled
-    // through capture + colour convert + a downscale at full 5K before a single
-    // pixel is encoded. That capture-and-throw-away is a major latency source on
-    // HiDPI hosts. Pinning the capture to the target height (preserving aspect)
-    // makes macOS' ScreenCaptureKit hand us already-small frames, so the encoder
-    // gets exactly the pixels it will send — the delivered resolution is
-    // unchanged (still capped at maxHeight), only the wasted work is gone.
-    const nativeW = src.width || 1920;
-    const nativeH = src.height || 1080;
-    const wantHeight = Number(msg.maxHeight) || 0; // 0 = native, else cap
-    // Even dimensions only — H.264/HEVC 4:2:0 require them, and an odd capture
-    // size makes the encoder pad/reject the frame.
-    const capH = Math.max(2, (wantHeight > 0 ? Math.min(nativeH, wantHeight) : nativeH) & ~1);
-    const capW = Math.max(2, Math.round(nativeW * (capH / nativeH)) & ~1);
-    const captureHeight = capH;
+    // Capture at the display's native physical size and let the WebRTC encoder
+    // downscale to maxHeight (scaleResolutionDownBy). We tried pinning the
+    // capture itself to the smaller encode target to save pixels, but on macOS a
+    // *scaled* desktop capture (min=max set below native) is very slow to
+    // establish per display — and because captures are serialized (below), each
+    // extra screen then waited minutes before its picture appeared. Native
+    // capture negotiates instantly, so all monitors come up at once.
+    const captureHeight = Number(src.height) || 1080;
 
     // Each screen names its own source id explicitly (chromeMediaSourceId) — no
     // shared global slot, so three concurrent screens never race for the wrong
@@ -370,10 +361,10 @@ class HostEngine {
           mandatory: {
             chromeMediaSource: 'desktop',
             chromeMediaSourceId: src.id,
-            minWidth: capW,
-            minHeight: capH,
-            maxWidth: capW,
-            maxHeight: capH,
+            minWidth: src.width || 640,
+            minHeight: src.height || 480,
+            maxWidth: src.width || 8192,
+            maxHeight: src.height || 8192,
             maxFrameRate: fps,
           },
         },
