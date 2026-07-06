@@ -75,6 +75,24 @@ jobs:
           security find-identity -v -p codesigning
           echo "signed=1" >> "$GITHUB_OUTPUT"
 
+      # Pre-create the draft release so BOTH platform jobs upload into the SAME
+      # release. Without this, electron-builder races to create the release while
+      # uploading its first assets and can spawn a duplicate — splitting the mac
+      # and windows artifacts (and the update manifests latest-mac.yml /
+      # latest.yml) across two releases, leaving neither one complete.
+      - name: Ensure the draft release exists
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="v$APP_VERSION"
+          if gh release view "$TAG" --repo vixco/warp >/dev/null 2>&1; then
+            echo "release $TAG already exists"
+          else
+            gh release create "$TAG" --repo vixco/warp --draft \
+              --target "$GITHUB_SHA" --title "$APP_VERSION" --notes "Publishing…"
+          fi
+
       - name: Build & publish (signed if cert present)
         run: npx electron-builder --mac --publish always
         env:
@@ -105,15 +123,13 @@ jobs:
   # uploaded their artifacts, so latest.yml / latest-mac.yml are guaranteed
   # present before any client sees the release.
   #
-  # electron-builder can RACE while uploading a job's several artifacts and
-  # create a second, incomplete release for the same tag (one release ends up
-  # with all installers + update manifests, the other with a single stray file).
-  # Which of the two GitHub then treats as "Latest" is nondeterministic, so
-  # `gh release edit <tag>` sometimes published the empty duplicate — leaving
-  # clients with "Cannot find latest-mac.yml in the latest release artifacts".
-  # So instead of editing by tag, we resolve the tag to the COMPLETE release
-  # (the one carrying the most assets), delete any incomplete duplicates, and
-  # publish that one as the single public Latest.
+  # The release is pre-created (see the mac job) so both platforms upload into
+  # ONE release — there is normally no duplicate to reconcile. This step is
+  # nonetheless defensive: it selects the release that actually carries the mac
+  # update manifest (latest-mac.yml) and publishes THAT one as Latest by id,
+  # rather than editing an ambiguous tag. It NEVER deletes a release — an earlier
+  # version deleted "duplicates" before verifying and destroyed the release that
+  # held latest-mac.yml when electron-builder split artifacts across two.
   #
   # The body also carries the macOS install note: without an Apple Developer ID
   # the build is only ad-hoc signed, so macOS Gatekeeper quarantines the browser
@@ -123,7 +139,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: [mac, windows]
     steps:
-      - name: Publish the complete release, retire duplicates
+      - name: Publish the complete release as Latest
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: vixco/warp
@@ -146,27 +162,21 @@ jobs:
         run: |
           set -euo pipefail
           TAG="v$APP_VERSION"
-          # Every release GitHub currently holds for this tag, newest first.
-          # (No --paginate: a tag only ever has 1-2 releases and they sort to the
-          # top of page 1, so per-page jq stays correct.)
-          ids=$(gh api "repos/$REPO/releases" \
-            --jq "[.[] | select(.tag_name==\"$TAG\")] | sort_by(.assets|length) | reverse | .[].id")
-          if [ -z "$ids" ]; then echo "::error::no release found for $TAG"; exit 1; fi
-          # The complete release carries the most assets (installers + manifests);
-          # anything else for this tag is an incomplete race duplicate.
-          good=$(echo "$ids" | head -n1)
-          for id in $ids; do
-            if [ "$id" != "$good" ]; then
-              echo "Deleting incomplete duplicate release $id for $TAG"
-              gh api -X DELETE "repos/$REPO/releases/$id"
-            fi
-          done
-          # Guard: the winner must actually carry the mac update manifest, else
-          # publishing it would ship the same broken "no latest-mac.yml" state.
-          has_yml=$(gh api "repos/$REPO/releases/$good" \
-            --jq '[.assets[].name] | any(. == "latest-mac.yml")')
-          if [ "$has_yml" != "true" ]; then
-            echo "::error::release $good for $TAG is missing latest-mac.yml"; exit 1
+          # The real release is the one carrying the macOS update manifest. Among
+          # any releases for this tag that have latest-mac.yml, take the one with
+          # the most assets (the fullest). Never delete anything.
+          good=$(gh api "repos/$REPO/releases" --jq \
+            "[.[] | select(.tag_name==\"$TAG\") | select([.assets[].name] | any(. == \"latest-mac.yml\"))] | sort_by(.assets|length) | reverse | (.[0].id // empty)")
+          if [ -z "$good" ]; then
+            echo "::error::no v$TAG release carries latest-mac.yml — not publishing a broken update"
+            exit 1
+          fi
+          # Windows clients need latest.yml on the same release; warn (don't fail)
+          # if the artifacts were split, so at least macOS updates still ship.
+          has_win=$(gh api "repos/$REPO/releases/$good" \
+            --jq '[.assets[].name] | any(. == "latest.yml")')
+          if [ "$has_win" != "true" ]; then
+            echo "::warning::v$TAG release $good is missing latest.yml (Windows update manifest)"
           fi
           gh api -X PATCH "repos/$REPO/releases/$good" \
             -F draft=false -f make_latest=true -f body="$NOTES" >/dev/null
