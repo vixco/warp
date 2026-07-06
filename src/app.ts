@@ -235,7 +235,35 @@ interface HostSession {
   reqBitrate: number;                  // this screen's requested ceiling (Mbps), pre-sharing
   audioStream: MediaStream | null;   // system audio being sent to the client
   micPlayer: HTMLAudioElement | null; // client microphone played on the host
+  // Adaptive-quality control state (AIMD on an absolute per-session bitrate cap).
+  adaptCapMbps: number;   // effective ceiling this loop owns; starts = shared share
+  lossEwma: number;       // smoothed receiver-reported fractionLost
+  rttEwma: number; rttBaseMs: number;
+  stableTicks: number;    // consecutive clean ticks (gate for raising)
+  holdTicks: number;      // ticks left blocking a raise after a cut
+  coolTicks: number;      // ticks left blocking a further cut after a cut
+  qlBwTicks: number;      // consecutive 'bandwidth' quality-limitation ticks
+  lastBytesSent: number; lastStatTs: number;
 }
+
+// Adaptive-quality (AIMD) tuning. The controller keeps the send bitrate just
+// below what the link can sustain so WebRTC's congestion control never probes up
+// into WiFi loss and oscillates ("gaar"). It is a strict no-op on a clean link:
+// with fractionLost ~0 and no 'bandwidth' quality-limitation, no cut ever fires,
+// so the cap stays pinned at the full shared share.
+const ADAPT_INTERVAL_MS = 1000;   // one control tick per RTCP report interval
+const LOSS_HIGH = 0.02;           // >2% smoothed receiver loss → back off
+const LOSS_SEVERE = 0.08;         // >8% → a harder one-shot cut
+const LOSS_LOW = 0.005;           // <0.5% → clean enough to consider raising
+const BETA = 0.85;                // multiplicative decrease: gentle −15% reads smooth
+const BETA_SEVERE = 0.70;         // harder cut when severe loss
+const AVAIL_HEADROOM = 0.95;      // on a cut, snap to 95% of GCC's own estimate
+const STEP_MBPS = 2;              // additive increase per clean tick
+const UP_STABLE_TICKS = 5;        // must be clean this many ticks before raising
+const DOWN_COOLDOWN_TICKS = 2;    // after a cut, block further cuts (let RR catch up)
+const UP_HOLD_TICKS = 8;          // after a cut, block raises (don't re-probe the loss)
+const QL_BW_TICKS = 2;            // debounce 'bandwidth' quality-limitation
+const RTT_INFLATE_MS = 30;        // RTT rise over baseline that signals bufferbloat
 
 class HostEngine {
   sessions = new Map<string, HostSession>();
@@ -270,16 +298,31 @@ class HostEngine {
     return Math.max(HostEngine.PER_STREAM_FLOOR_MBPS, Math.round(s.reqBitrate / n));
   }
 
+  // The ceiling actually applied to the encoder: the smaller of this screen's
+  // shared share and the adaptive controller's cap (never below the floor). The
+  // adaptive loop only ever writes `adaptCapMbps`; every place that applies a
+  // bitrate goes through here, so on a clean link (adaptCap == share) it's a
+  // no-op, and the multi-monitor split still owns the share.
+  private effectiveBitrateMbps(s: HostSession): number {
+    const share = this.perStreamBitrateMbps(s);
+    const cap = s.adaptCapMbps ?? share;
+    return Math.max(HostEngine.PER_STREAM_FLOOR_MBPS, Math.min(share, Math.round(cap)));
+  }
+
   // Re-apply each live screen's shared bitrate ceiling. Called whenever the set
   // of active screens changes (a monitor connects or disconnects), so the split
   // widens back out the instant a screen closes and tightens when one joins.
   private async rebalanceBitrates() {
     for (const s of this.sessions.values()) {
       if (!s.sender) continue;
+      // The share may have shrunk (a screen joined) — clamp the adaptive cap into
+      // the new band so the aggregate never exceeds the link. A widened share (a
+      // screen left) is re-probed additively by the loop, never burst.
+      s.adaptCapMbps = Math.min(this.perStreamBitrateMbps(s), s.adaptCapMbps ?? this.perStreamBitrateMbps(s));
       try {
         const params = s.sender.getParameters();
         params.encodings = params.encodings?.length ? params.encodings : [{}];
-        params.encodings[0].maxBitrate = this.perStreamBitrateMbps(s) * 1_000_000;
+        params.encodings[0].maxBitrate = this.effectiveBitrateMbps(s) * 1_000_000;
         await s.sender.setParameters(params);
       } catch { /* a transient renegotiation can reject setParameters; next call fixes it */ }
     }
@@ -288,6 +331,89 @@ class HostEngine {
   constructor() {
     warp.onEngineMessage(({ sessionId, msg }) => this.handle(sessionId, msg));
     setInterval(() => this.syncClipboard(), 1500);
+    // Adaptive-quality control tick: one AIMD step per session per second.
+    setInterval(() => { for (const [id, s] of this.sessions) this.adaptTick(id, s); }, ADAPT_INTERVAL_MS);
+  }
+
+  // One adaptive-quality step for a session: read the receiver-reported loss and
+  // the encoder/transport stats, then nudge this session's absolute bitrate cap
+  // down (multiplicatively, on real loss) or up (additively, only when clean and
+  // actually pushing against the cap). Provably a no-op on a clean link.
+  private async adaptTick(id: string, s: HostSession) {
+    if (!s.sender || s.pc.connectionState !== 'connected') return;
+    let stats: RTCStatsReport;
+    try { stats = await s.pc.getStats(); } catch { return; }
+
+    let fracLost = 0, rttMs = -1, availMbps = -1, qlr = 'none';
+    let bytesSent = 0, ts = 0, haveRemote = false;
+    stats.forEach((r: any) => {
+      if (r.type === 'remote-inbound-rtp' && r.kind === 'video') {
+        fracLost = r.fractionLost ?? 0; haveRemote = true;
+        if (r.roundTripTime != null) rttMs = r.roundTripTime * 1000;
+      } else if (r.type === 'outbound-rtp' && r.kind === 'video') {
+        qlr = r.qualityLimitationReason || 'none';
+        bytesSent = r.bytesSent || 0; ts = r.timestamp;
+      } else if (r.type === 'candidate-pair' &&
+                 (r.nominated || r.state === 'succeeded') &&
+                 r.availableOutgoingBitrate != null) {
+        availMbps = r.availableOutgoingBitrate / 1e6;
+        if (rttMs < 0 && r.currentRoundTripTime != null) rttMs = r.currentRoundTripTime * 1000;
+      }
+    });
+    if (!haveRemote) return; // no RTCP report yet — leave everything alone
+
+    s.lossEwma = 0.4 * fracLost + 0.6 * s.lossEwma;
+    if (rttMs >= 0) {
+      s.rttEwma = s.rttEwma ? 0.4 * rttMs + 0.6 * s.rttEwma : rttMs;
+      const base = Math.min(s.rttBaseMs, rttMs);
+      s.rttBaseMs = base + 0.01 * (rttMs - base); // fast to track down, slow to drift up
+    }
+    let sendMbps = 0;
+    if (s.lastStatTs && ts > s.lastStatTs) {
+      sendMbps = (bytesSent - s.lastBytesSent) * 8 / ((ts - s.lastStatTs) / 1000) / 1e6;
+    }
+    s.lastBytesSent = bytesSent; s.lastStatTs = ts;
+    s.qlBwTicks = qlr === 'bandwidth' ? s.qlBwTicks + 1 : 0;
+
+    const applied = this.effectiveBitrateMbps(s);
+    const share = this.perStreamBitrateMbps(s);
+    const pushing = sendMbps >= 0.85 * applied; // GCC pinned against our ceiling
+
+    const down =
+      s.lossEwma > LOSS_HIGH ||
+      (s.qlBwTicks >= QL_BW_TICKS && pushing) ||
+      (rttMs >= 0 && s.rttEwma > s.rttBaseMs + RTT_INFLATE_MS && pushing);
+
+    if (down && s.coolTicks === 0) {
+      const beta = s.lossEwma > LOSS_SEVERE ? BETA_SEVERE : BETA;
+      let next = applied * beta;
+      if (availMbps > 0) next = Math.min(next, availMbps * AVAIL_HEADROOM); // snap to real estimate
+      s.adaptCapMbps = Math.max(HostEngine.PER_STREAM_FLOOR_MBPS, next);
+      s.coolTicks = DOWN_COOLDOWN_TICKS; s.holdTicks = UP_HOLD_TICKS; s.stableTicks = 0;
+      await this.applyEffective(s);
+      return;
+    }
+    if (s.coolTicks > 0) s.coolTicks--;
+    if (s.holdTicks > 0) s.holdTicks--;
+
+    if (s.lossEwma < LOSS_LOW && qlr !== 'bandwidth') s.stableTicks++; else s.stableTicks = 0;
+    const canUp = s.stableTicks >= UP_STABLE_TICKS && s.holdTicks === 0 &&
+                  sendMbps >= 0.8 * applied && s.adaptCapMbps < share;
+    if (canUp) {
+      s.adaptCapMbps = Math.min(share, s.adaptCapMbps + STEP_MBPS);
+      s.stableTicks = 0;
+      await this.applyEffective(s);
+    }
+  }
+
+  private async applyEffective(s: HostSession) {
+    if (!s.sender) return;
+    try {
+      const p = s.sender.getParameters();
+      p.encodings = p.encodings?.length ? p.encodings : [{}];
+      p.encodings[0].maxBitrate = this.effectiveBitrateMbps(s) * 1_000_000;
+      await s.sender.setParameters(p);
+    } catch { /* transient renegotiation; next tick fixes it */ }
   }
 
   private lastClip = '';
@@ -423,8 +549,13 @@ class HostEngine {
       pc, stream, channel: null, fastChannel: null, displayId, sender: null, track,
       captureHeight, reqBitrate: Number(msg.bitrate) || 150,
       audioStream: audioCapture, micPlayer: null,
+      adaptCapMbps: Number(msg.bitrate) || 150,
+      lossEwma: 0, rttEwma: 0, rttBaseMs: 1e9,
+      stableTicks: 0, holdTicks: 0, coolTicks: 0, qlBwTicks: 0,
+      lastBytesSent: 0, lastStatTs: 0,
     };
     this.sessions.set(sessionId, session);
+    session.adaptCapMbps = this.perStreamBitrateMbps(session); // start at the full share → no-op
 
     // Two data channels so continuous mouse movement never gets stuck behind a
     // video retransmit:
@@ -508,7 +639,7 @@ class HostEngine {
       try {
         const params = sender.getParameters();
         params.encodings = params.encodings?.length ? params.encodings : [{}];
-        params.encodings[0].maxBitrate = this.perStreamBitrateMbps(session) * 1_000_000;
+        params.encodings[0].maxBitrate = this.effectiveBitrateMbps(session) * 1_000_000;
         params.encodings[0].maxFramerate = fps;
         params.encodings[0].scaleResolutionDownBy = scaleFor(captureHeight, maxHeight);
         (params.encodings[0] as any).priority = 'high';
@@ -553,11 +684,15 @@ class HostEngine {
       if (s.sender) {
         const params = s.sender.getParameters();
         params.encodings = params.encodings?.length ? params.encodings : [{}];
-        // Live bitrate change updates this screen's requested ceiling, then
-        // applies the SHARED slice so it still respects the multi-screen budget.
+        // Live bitrate change updates this screen's requested ceiling. A manual
+        // change is an explicit user action, so reset the adaptive cap to the new
+        // share (try what they asked) and clear the loss history so we don't cut
+        // on stale readings; the loop pulls back again if the link can't hold it.
         if (cfg.bitrate) {
           s.reqBitrate = Number(cfg.bitrate) || s.reqBitrate;
-          params.encodings[0].maxBitrate = this.perStreamBitrateMbps(s) * 1_000_000;
+          s.adaptCapMbps = this.perStreamBitrateMbps(s);
+          s.lossEwma = 0; s.stableTicks = 0; s.holdTicks = 0; s.coolTicks = 0;
+          params.encodings[0].maxBitrate = this.effectiveBitrateMbps(s) * 1_000_000;
         }
         // Clamp to the screen-capture ceiling — the capturer can't exceed it, so
         // asking for more only invites throttling (see MAX_CAPTURE_FPS).
