@@ -2,6 +2,11 @@
 // Viewer window: renders one remote display fullscreen on one local monitor,
 // captures mouse/keyboard and ships it to the host over a WebRTC data channel.
 
+// The macOS host's screen capture (Chromium/ScreenCaptureKit) tops out near
+// 60 fps, so the viewer never offers or reports more than this. Raise it in step
+// with the host if a native high-fps capture path is ever added.
+const MAX_STREAM_FPS = 60;
+
 const params = new URLSearchParams(location.search);
 const P = {
   sessionId: params.get('sessionId') || `s-${Math.random().toString(36).slice(2)}`,
@@ -10,7 +15,9 @@ const P = {
   code: params.get('code') || '',
   clientId: params.get('clientId') || '',
   displayId: Number(params.get('displayId')) || 0,
-  fps: Number(params.get('fps')) || 60,
+  // Clamp to the screen-capture ceiling: the macOS host can't capture above
+  // ~60 fps, so showing/keeping a higher number here would misrepresent reality.
+  fps: Math.min(Number(params.get('fps')) || 60, MAX_STREAM_FPS),
   bitrate: Number(params.get('bitrate')) || 150,
   codec: params.get('codec') || 'h264',
   mode: params.get('mode') || 'sharp',
@@ -530,9 +537,14 @@ const menuRes = document.getElementById('menuRes') as HTMLSelectElement;
 document.getElementById('menuLabel')!.textContent = P.label;
 
 menuBitrate.value = [25, 50, 100, 150, 300, 400, 600].includes(P.bitrate) ? String(P.bitrate) : '150';
+// Drop frame rates the host can't actually capture (> MAX_STREAM_FPS), so the
+// menu never offers a number that silently clamps.
+for (const o of [...menuFps.options]) {
+  if (Number(o.value) > MAX_STREAM_FPS) o.remove();
+}
 // Reflect the per-monitor frame rate this screen was started at. If it's an
-// unusual rate not in the preset list (e.g. a 100 Hz panel), add it so the
-// menu shows the true value instead of snapping to another.
+// unusual rate not in the preset list (e.g. a 50 Hz panel), add it so the menu
+// shows the true value instead of snapping to another.
 if (![...menuFps.options].some((o) => o.value === String(P.fps))) {
   menuFps.add(new Option(`${P.fps} fps`, String(P.fps)));
   [...menuFps.options]

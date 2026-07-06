@@ -6,6 +6,11 @@ const $ = <T extends HTMLElement = HTMLElement>(sel: string) =>
 
 const warp = window.warp;
 
+// The practical ceiling for macOS screen capture through Chromium's desktop
+// capturer (ScreenCaptureKit, default 1/60 s frame interval). Asking for more
+// just makes the capture over-commit and auto-throttle; 60 is the steady target.
+const MAX_CAPTURE_FPS = 60;
+
 // ---------------------------------------------------------------------------
 // Navigation
 
@@ -332,7 +337,14 @@ class HostEngine {
       return;
     }
 
-    const fps = Number(msg.fps) || 60;
+    // Clamp to the real screen-capture ceiling. macOS ScreenCaptureKit (which
+    // Chromium's desktop capturer uses) defaults to a 1/60 s frame interval, so
+    // the capturer cannot deliver more than ~60 fps no matter what we ask for —
+    // requesting 120/165 only makes the pipeline over-commit and Chromium
+    // auto-throttle harder, which is what dropped delivery to ~30. Targeting a
+    // realistic 60 lets it hold a steady 60 during motion. (>60 needs a native
+    // capture path, out of scope here.)
+    const fps = Math.min(Number(msg.fps) || 60, MAX_CAPTURE_FPS);
     const src = source as any;
     const hostSettings = await warp.getSettings();
     const wantAudio = !!msg.wantAudio;
@@ -547,7 +559,11 @@ class HostEngine {
           s.reqBitrate = Number(cfg.bitrate) || s.reqBitrate;
           params.encodings[0].maxBitrate = this.perStreamBitrateMbps(s) * 1_000_000;
         }
-        if (cfg.fps) params.encodings[0].maxFramerate = Number(cfg.fps);
+        // Clamp to the screen-capture ceiling — the capturer can't exceed it, so
+        // asking for more only invites throttling (see MAX_CAPTURE_FPS).
+        if (cfg.fps) {
+          params.encodings[0].maxFramerate = Math.min(Number(cfg.fps), MAX_CAPTURE_FPS);
+        }
         // Live resolution cap: fewer pixels to encode/transmit/decode is the
         // biggest latency lever on a high-DPI host.
         if (cfg.maxHeight !== undefined) {
@@ -559,7 +575,9 @@ class HostEngine {
         await s.sender.setParameters(params);
       }
       if (s.track && cfg.fps) {
-        await s.track.applyConstraints({ frameRate: { max: Number(cfg.fps) } });
+        await s.track.applyConstraints({
+          frameRate: { max: Math.min(Number(cfg.fps), MAX_CAPTURE_FPS) },
+        });
       }
     } catch (err) { console.warn('applyConfig failed', err); }
   }
@@ -932,17 +950,17 @@ $('#cmConnectBtn').addEventListener('click', async () => {
 
 const RESOLUTIONS = ['1920x1080', '2560x1440', '3440x1440', '3840x2160'];
 
-// Standard frame rates we offer per monitor. The list shown for a given
-// monitor is capped at its native refresh rate (you can't display more than
-// the panel refreshes), and always includes the exact native rate plus 60 as
-// a safe baseline — so a 165 Hz monitor offers up to 165, a 240 Hz up to 240.
+// Frame rates offered per monitor. Capped at BOTH the panel's refresh rate and
+// MAX_CAPTURE_FPS — macOS screen capture can't exceed ~60 fps, so offering 120/
+// 165 would just be a number the host silently clamps (the "I set 165 but see
+// 30" confusion). When a native path lifts the capture ceiling, raise the cap.
 const FPS_LADDER = [24, 30, 48, 50, 60, 75, 90, 100, 120, 144, 165, 200, 240, 360];
 
 function fpsOptionsFor(refreshRate: number): number[] {
-  const native = Math.round(refreshRate) || 60;
+  const native = Math.min(Math.round(refreshRate) || 60, MAX_CAPTURE_FPS);
   const set = new Set(FPS_LADDER.filter((f) => f <= native));
-  set.add(60);       // always a safe baseline
-  set.add(native);   // always offer the panel's exact rate
+  set.add(Math.min(60, MAX_CAPTURE_FPS)); // always a safe baseline
+  set.add(native);                        // the panel's exact rate (capped)
   return [...set].sort((a, b) => a - b);
 }
 
@@ -1167,8 +1185,9 @@ function renderMapRows() {
     if (select.value !== wantedChoice) select.value = 'new'; // stale display id
     resSelect.value = prevRes[i] ?? rs?.res ?? 'auto';
     if (!resSelect.value) resSelect.value = 'auto';
-    fpsSelect.value = prevFps[i] ?? rs?.fps ?? String(refreshRate);
-    if (!fpsSelect.value) fpsSelect.value = String(refreshRate);
+    const defaultFps = String(Math.min(refreshRate, MAX_CAPTURE_FPS));
+    fpsSelect.value = prevFps[i] ?? rs?.fps ?? defaultFps;
+    if (!fpsSelect.value) fpsSelect.value = defaultFps;
 
     const syncResVisibility = () => {
       resSelect.style.display = select.value === 'new' ? 'block' : 'none';
