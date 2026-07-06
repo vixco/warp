@@ -640,12 +640,14 @@ document.getElementById('menuResume')!.addEventListener('click', () => toggleMen
 document.getElementById('menuDisconnect')!.addEventListener('click', disconnect);
 
 let lastBytes = 0, lastFrames = 0, lastTs = 0;
+let lastLost = 0, lastRecv = 0, lastFec = 0, lastNack = 0;
 setInterval(async () => {
   if (!pc || pc.connectionState !== 'connected') { ovStats.textContent = '—'; return; }
   try {
     const stats = await pc.getStats();
     let fps = 0, kbps = 0, rttMs = -1, w = 0, h = 0, audioBytes = 0;
     let decoder = '', hwDecode = false, jbMs = -1, procMs = -1, dropped = 0;
+    let lossPct = -1, fecRate = 0, nackRate = 0;
     stats.forEach((s: any) => {
       if (s.type === 'inbound-rtp' && s.kind === 'audio') {
         audioBytes = s.bytesReceived || 0;
@@ -660,6 +662,19 @@ setInterval(async () => {
           }
         }
         lastTs = now; lastFrames = s.framesDecoded; lastBytes = s.bytesReceived;
+        // Network health on the receive side, per interval. Packet loss is the
+        // WiFi smoothness killer; fec = packets FlexFEC reconstructed WITHOUT a
+        // retransmit (proves FEC is active and helping); nack = retransmits we
+        // had to request (the slow, stall-prone path FEC exists to avoid).
+        const lost = s.packetsLost || 0;
+        const recv = s.packetsReceived || 0;
+        const dLost = Math.max(0, lost - lastLost);
+        const dRecv = Math.max(0, recv - lastRecv);
+        if (dLost + dRecv > 0) lossPct = (dLost / (dLost + dRecv)) * 100;
+        fecRate = Math.max(0, (s.fecPacketsReceived || 0) - lastFec);
+        nackRate = Math.max(0, (s.nackCount || 0) - lastNack);
+        lastLost = lost; lastRecv = recv;
+        lastFec = s.fecPacketsReceived || 0; lastNack = s.nackCount || 0;
         w = s.frameWidth; h = s.frameHeight;
         // Is the frame being decoded on the GPU (D3D11/NVDEC) or has Chromium
         // silently fallen back to a software decoder? Software decode of a
@@ -694,10 +709,20 @@ setInterval(async () => {
     const decoderText = decoder
       ? ` · ${hwDecode ? 'HW' : '⚠ SW'} decode` + (jbMs >= 0 ? ` · jb ${jbMs}ms` : '')
       : '';
-    document.getElementById('menuStats')!.textContent = statsText + decoderText;
+    // Network line: packet loss (the WiFi jank source), plus how it's being
+    // recovered — fec = repaired instantly by FlexFEC, nack = retransmit
+    // requested (the slow path). If loss is high and fec stays 0, FlexFEC didn't
+    // activate; if fec tracks loss, it's working and the picture should hold.
+    const netText = lossPct >= 0
+      ? ` · loss ${lossPct.toFixed(1)}%` +
+        (fecRate > 0 ? ` · fec ${fecRate}/s` : '') +
+        (nackRate > 0 ? ` · nack ${nackRate}/s` : '')
+      : '';
+    document.getElementById('menuStats')!.textContent = statsText + decoderText + netText;
     if (params.has('debug')) {
       console.log(`warp-stats ${JSON.stringify(
-        { w, h, fps, kbps, rttMs, audioBytes, decoder, hwDecode, jbMs, procMs, dropped })}`);
+        { w, h, fps, kbps, rttMs, audioBytes, decoder, hwDecode, jbMs, procMs, dropped,
+          lossPct: lossPct >= 0 ? Number(lossPct.toFixed(2)) : -1, fecRate, nackRate })}`);
     }
   } catch { /* ignore */ }
 }, 1000);

@@ -72,6 +72,19 @@ if (process.platform === 'win32') {
 app.commandLine.appendSwitch('enable-features', enableFeatures.join(','));
 app.commandLine.appendSwitch('disable-features', disableFeatures.join(','));
 
+// Forward Error Correction for video over lossy links (WiFi). By default WebRTC
+// recovers a lost packet by asking the sender to retransmit it (NACK/ARQ) — on a
+// jittery WiFi uplink that reply arrives late and stalls the frame, the
+// micro-stutter that makes a stream feel "not smooth / gaar". FlexFEC instead
+// sends redundant repair packets so the receiver reconstructs a lost packet
+// immediately, with no round-trip. It is the only WebRTC FEC that is
+// codec-agnostic (it protects our H.264 / HEVC; ULPFEC does nothing for H.26x).
+// Two field trials are required: one advertises flexfec in the SDP so the sender
+// enables it, the other actually emits the repair packets. (Whether it activates
+// is confirmable live in the viewer's stats overlay via fecPacketsReceived.)
+app.commandLine.appendSwitch('force-fieldtrials',
+  'WebRTC-FlexFEC-03-Advertised/Enabled/WebRTC-FlexFEC-03/Enabled/');
+
 interface Settings {
   hostName: string;
   port: number;
