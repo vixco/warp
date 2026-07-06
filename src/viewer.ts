@@ -488,12 +488,26 @@ window.addEventListener('keyup', (e) => {
 // Release all keys/buttons on host when this window loses focus.
 window.addEventListener('blur', () => { dragging = false; sendInput({ t: 'reset' }); });
 
-// Capture OS-level keys (Alt+Tab, etc.) where the platform allows it.
+// Capture the Windows / Meta key so it reaches the host as Cmd instead of
+// popping the Windows Start menu (which also steals focus, tripping the blur
+// reset above and dropping the modifier). Keyboard Lock only intercepts
+// OS-reserved keys while the page is in *JavaScript-initiated* fullscreen —
+// Electron's window-level `fullscreen: true` does NOT satisfy that — so we must
+// enter the Fullscreen API first. requestFullscreen needs a transient user
+// gesture, so the first pointerdown / keydown kicks it off; we re-assert on
+// fullscreenchange and on focus (the lock is released whenever the window loses
+// focus). Scoped to the Meta keys so Escape / Alt+Tab keep their local meaning
+// and the user can never get trapped.
 async function lockKeyboard() {
-  try { await navigator.keyboard?.lock(); } catch { /* unsupported */ }
+  try {
+    if (!document.fullscreenElement) await document.documentElement.requestFullscreen();
+    await navigator.keyboard?.lock(['MetaLeft', 'MetaRight']);
+  } catch { /* unsupported, or no user activation yet — retried on next gesture */ }
 }
-lockKeyboard();
+window.addEventListener('pointerdown', lockKeyboard, { once: true });
+window.addEventListener('keydown', lockKeyboard, { once: true });
 document.addEventListener('fullscreenchange', lockKeyboard);
+window.addEventListener('focus', lockKeyboard);
 
 // ---------------------------------------------------------------------------
 // Clipboard: client -> host
@@ -758,22 +772,28 @@ setInterval(async () => {
   } catch { /* ignore */ }
 }, 1000);
 
-// Reveal the top control bar (and the local OS cursor) the instant the pointer
-// nears the top edge — driven from JS rather than a thin CSS :hover strip, so
-// the bar shows immediately instead of needing the cursor parked precisely on a
-// 14px zone. Over the rest of the picture the cursor stays hidden so the only
-// visible pointer is the real macOS cursor captured in the stream.
+// Reveal the top control bar only after the pointer has DWELT in the top zone
+// for a few seconds, so merely moving the cursor up to the top edge (e.g. to
+// reach a window's title bar on the host) no longer flashes the bar up. It's a
+// deliberate "summon" gesture, not an accidental hover. Over the rest of the
+// picture the cursor stays hidden so the only visible pointer is the real macOS
+// cursor captured in the stream.
 const TOP_REVEAL_PX = 90;
+const TOP_HOLD_MS = 5000; // dwell time in the top zone before the bar appears
 let overlayHideTimer: ReturnType<typeof setTimeout> | undefined;
+let topHoldTimer: ReturnType<typeof setTimeout> | undefined;
+let overlayShown = false;
 
 function setOverlay(show: boolean) {
   clearTimeout(overlayHideTimer);
   if (show) {
+    overlayShown = true;
     overlay.classList.add('show');
     document.body.classList.add('show-cursor');
   } else {
     // Small grace period so a quick move away doesn't yank the bar/cursor.
     overlayHideTimer = setTimeout(() => {
+      overlayShown = false;
       overlay.classList.remove('show');
       if (!menuOpen) document.body.classList.remove('show-cursor');
     }, 250);
@@ -782,18 +802,37 @@ function setOverlay(show: boolean) {
 
 window.addEventListener('pointermove', (e) => {
   if (menuOpen) return; // OS cursor + bar stay visible while the menu is open
-  setOverlay(e.clientY < TOP_REVEAL_PX);
+  const inZone = e.clientY < TOP_REVEAL_PX;
+  if (inZone) {
+    if (overlayShown) { setOverlay(true); return; } // already up — keep it, cancel hide
+    // Start the dwell timer on first entering the zone; further moves inside the
+    // zone don't restart it, so it fires after a continuous 5 s (even if the
+    // pointer then holds perfectly still). Leaving the zone cancels it below.
+    if (!topHoldTimer) {
+      topHoldTimer = setTimeout(() => { topHoldTimer = undefined; setOverlay(true); }, TOP_HOLD_MS);
+    }
+  } else {
+    if (topHoldTimer) { clearTimeout(topHoldTimer); topHoldTimer = undefined; }
+    setOverlay(false);
+  }
 });
 
 // Flash the bar briefly on connect so the Settings button is discoverable,
 // then let it tuck away.
 function flashOverlay() {
+  overlayShown = true;
   overlay.classList.add('show');
   clearTimeout(overlayHideTimer);
   overlayHideTimer = setTimeout(() => {
+    overlayShown = false;
     if (!menuOpen) overlay.classList.remove('show');
   }, 2600);
 }
+
+// If the chosen codec can't be hardware-decoded on this machine, fall back to
+// H.264 (always available) before the first connect — so making HEVC the shipped
+// default can never dead-end a viewer whose GPU lacks HEVC decode.
+if (!decodableCodecs().has(P.codec)) P.codec = 'h264';
 
 connect();
 flashOverlay();

@@ -120,7 +120,11 @@ function loadSettings(): Settings {
     // for 1440p desktop and much steadier; raise it in the menu on a wired LAN.
     maxBitrateMbps: 100,
     maxHeight: 1440,
-    codec: 'h264',
+    // HEVC by default: ~40% better quality-per-bit than H.264, so the same
+    // picture is fewer bytes to push (steadier on WiFi) or sharper at the same
+    // bitrate. Viewers that can't hardware-decode HEVC fall back to H.264
+    // automatically (see the viewer's decodableCodecs guard), so this is safe.
+    codec: 'hevc',
     hidpiVirtual: false,
     hostingEnabled: false,
     launchAtLogin: true,
