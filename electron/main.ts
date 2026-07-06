@@ -841,6 +841,39 @@ function wireIpc() {
       clipboard.writeText(text);
     }
   });
+
+  // Clipboard images (copy a screenshot on one machine, paste on the other).
+  ipcMain.handle('get-clipboard-image', () => {
+    try {
+      const img = clipboard.readImage();
+      return img.isEmpty() ? null : img.toDataURL(); // data:image/png;base64,…
+    } catch { return null; }
+  });
+  ipcMain.on('set-clipboard-image', (_e, dataUrl: string) => {
+    try {
+      if (typeof dataUrl === 'string' && dataUrl.startsWith('data:image')) {
+        clipboard.writeImage(nativeImage.createFromDataURL(dataUrl));
+      }
+    } catch { /* ignore */ }
+  });
+
+  // Save a file dropped from the viewer to the host's Downloads folder.
+  ipcMain.handle('save-incoming-file', (_e, name: string, dataUrl: string) => {
+    try {
+      // base64 alphabet has no ';base64,', so matching the first is unambiguous.
+      const m = /;base64,(.*)$/.exec(String(dataUrl || ''));
+      if (!m) return { ok: false };
+      const safe = path.basename(String(name || 'warp-file')).replace(/[/\\]/g, '_') || 'warp-file';
+      const dir = app.getPath('downloads');
+      let out = path.join(dir, safe);
+      // Don't clobber: append " (n)" before the extension if it exists.
+      const ext = path.extname(safe), base = safe.slice(0, safe.length - ext.length);
+      let n = 1;
+      while (fs.existsSync(out)) { out = path.join(dir, `${base} (${n++})${ext}`); }
+      fs.writeFileSync(out, Buffer.from(m[1], 'base64'));
+      return { ok: true, path: out };
+    } catch (err: any) { return { ok: false, error: err?.message }; }
+  });
 }
 
 // ---------------------------------------------------------------------------

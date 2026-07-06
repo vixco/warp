@@ -339,6 +339,7 @@ class HostEngine {
     warp.onEngineMessage(({ sessionId, msg }) => this.handle(sessionId, msg));
     warp.onCursorUpdate((m) => this.onCursorUpdate(m));
     setInterval(() => this.syncClipboard(), 1500);
+    setInterval(() => this.syncClipboardImage(), 2500);
     // Adaptive-quality control tick: one AIMD step per session per second.
     setInterval(() => { for (const [id, s] of this.sessions) this.adaptTick(id, s); }, ADAPT_INTERVAL_MS);
   }
@@ -730,11 +731,54 @@ class HostEngine {
       if (msg.t === 'clip') {
         this.lastClip = msg.s;
         warp.setClipboard(msg.s);
+      } else if (msg.t === 'blob' || msg.t === 'blobc') {
+        this.handleBlob(msg);
       } else if (msg.t === 'cfg') {
         this.applyConfig(sessionId, msg);
       } else {
         // Everything else is an input event; displayId is attached client-side
         warp.injectInput(msg);
+      }
+    } catch { /* ignore */ }
+  }
+
+  // Chunked transfer receive: a clipboard image or a dropped file, reassembled
+  // from base64 chunks sent over the reliable channel.
+  private incomingBlobs = new Map<string, { kind: string; total: number; parts: string[]; name?: string }>();
+  private lastImgSig = '';
+  private handleBlob(msg: any) {
+    if (msg.t === 'blob') {
+      this.incomingBlobs.set(msg.id, { kind: msg.kind, total: msg.total, parts: [], name: msg.name });
+      return;
+    }
+    const b = this.incomingBlobs.get(msg.id);
+    if (!b) return;
+    b.parts[msg.seq] = msg.d;
+    let have = 0; for (const p of b.parts) if (p !== undefined) have++;
+    if (have < b.total) return;
+    this.incomingBlobs.delete(msg.id);
+    const dataUrl = b.parts.join('');
+    if (b.kind === 'img') {
+      this.lastImgSig = blobSig(dataUrl);
+      warp.setClipboardImage(dataUrl);
+    } else if (b.kind === 'file') {
+      warp.saveIncomingFile(b.name || 'warp-file', dataUrl).then((res) => {
+        toast(res.ok ? `Received ${b.name} → Downloads` : 'Could not save file', !res.ok);
+      });
+    }
+  }
+
+  // Host clipboard image -> all clients (one direction of image clipboard sync;
+  // the other direction is handled client-side).
+  private async syncClipboardImage() {
+    if (this.sessions.size === 0) return;
+    try {
+      const d = await warp.getClipboardImage();
+      if (d && blobSig(d) !== this.lastImgSig) {
+        this.lastImgSig = blobSig(d);
+        for (const s of this.sessions.values()) {
+          if (s.channel?.readyState === 'open') sendBlob(s.channel, 'img', d);
+        }
       }
     } catch { /* ignore */ }
   }
@@ -835,6 +879,28 @@ async function findVirtualAudioDevice(): Promise<string | null> {
     if (virtual) console.log(`system audio via virtual device: ${virtual.label}`);
     return virtual?.deviceId ?? null;
   } catch { return null; }
+}
+
+// Cheap signature of a data-URL for change detection / echo suppression — full
+// content compare would be costly for a large image, and length + tail is a
+// reliable enough fingerprint for clipboard use.
+function blobSig(d: string): string { return d.length + '|' + d.slice(-256); }
+
+// Chunked send of a data-URL over a reliable data channel (clipboard image /
+// file). Base64 chunks ride the existing JSON message routing; backpressure via
+// bufferedAmount keeps a big file from overflowing the send buffer.
+const BLOB_CHUNK = 48 * 1024;
+const MAX_BLOB_CHARS = 44 * 1024 * 1024; // ~32MB after base64 expansion
+async function sendBlob(ch: RTCDataChannel, kind: string, dataUrl: string, extra: Record<string, any> = {}) {
+  if (ch.readyState !== 'open' || dataUrl.length > MAX_BLOB_CHARS) return;
+  const id = 'b' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+  const total = Math.ceil(dataUrl.length / BLOB_CHUNK);
+  ch.send(JSON.stringify({ t: 'blob', id, kind, total, ...extra }));
+  for (let i = 0; i < total; i++) {
+    while (ch.bufferedAmount > 8 * 1024 * 1024) await new Promise((r) => setTimeout(r, 20));
+    if (ch.readyState !== 'open') return;
+    ch.send(JSON.stringify({ t: 'blobc', id, seq: i, d: dataUrl.slice(i * BLOB_CHUNK, (i + 1) * BLOB_CHUNK) }));
+  }
 }
 
 // Downscale factor to cap the encoded height at `maxHeight` (0/native = 1).

@@ -66,4 +66,10 @@ contextBridge.exposeInMainWorld('warp', {
   // clipboard sync
   getClipboard: () => ipcRenderer.invoke('get-clipboard'),
   setClipboard: (text: string) => ipcRenderer.send('set-clipboard', text),
+  getClipboardImage: () => ipcRenderer.invoke('get-clipboard-image'),
+  setClipboardImage: (dataUrl: string) => ipcRenderer.send('set-clipboard-image', dataUrl),
+
+  // file transfer (viewer -> host)
+  saveIncomingFile: (name: string, dataUrl: string) =>
+    ipcRenderer.invoke('save-incoming-file', name, dataUrl),
 });

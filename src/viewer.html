@@ -147,6 +147,19 @@
     .menu-actions button.danger { background: #b91c1c; border-color: #b91c1c; }
     .menu-actions button.danger:hover { background: #dc2626; }
     .menu-hint { color: #566074; font-size: 11px; margin-top: 14px; text-align: center; }
+
+    /* transient bottom toast (file transfer / clipboard feedback) */
+    #notify {
+      position: fixed; left: 50%; bottom: 28px;
+      transform: translate(-50%, 20px);
+      background: rgba(16, 20, 28, 0.94);
+      border: 1px solid #263042; border-radius: 999px;
+      color: #e7ecf4; font-family: -apple-system, "Segoe UI", system-ui, sans-serif;
+      font-size: 13px; padding: 8px 16px;
+      opacity: 0; pointer-events: none; z-index: 30;
+      transition: opacity 0.18s ease, transform 0.18s ease;
+    }
+    #notify.show { opacity: 1; transform: translate(-50%, 0); }
   </style>
 </head>
 <body>
@@ -238,6 +251,8 @@
     <div class="msg" id="statusMsg">Connecting…</div>
     <button id="statusRetry" style="display:none">Reconnect</button>
   </div>
+
+  <div id="notify"></div>
 
   <script type="module" src="viewer.js"></script>
 </body>

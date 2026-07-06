@@ -37,6 +37,9 @@ export interface WarpApi {
   destroyVdisplay(token: number): Promise<any>;
   getClipboard(): Promise<string>;
   setClipboard(text: string): void;
+  getClipboardImage(): Promise<string | null>;
+  setClipboardImage(dataUrl: string): void;
+  saveIncomingFile(name: string, dataUrl: string): Promise<{ ok: boolean; path?: string; error?: string }>;
 }
 
 declare global {

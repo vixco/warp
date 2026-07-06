@@ -193,6 +193,7 @@ async function acceptOffer(sdp: string) {
         const msg = JSON.parse(String(ev.data));
         if (msg.t === 'clip') window.warp.setClipboard(msg.s);
         else if (msg.t === 'cur') applyCursor(msg);
+        else if (msg.t === 'blob' || msg.t === 'blobc') handleBlobMsg(msg);
       } catch { /* ignore */ }
     };
   };
@@ -531,6 +532,86 @@ setInterval(async () => {
     }
   } catch { /* ignore */ }
 }, 2000);
+
+// ---------------------------------------------------------------------------
+// Blob transfer: clipboard images (both ways) and files dropped onto the viewer
+// (viewer -> host), chunked over the reliable channel.
+
+const BLOB_CHUNK = 48 * 1024;
+const MAX_BLOB_CHARS = 44 * 1024 * 1024; // ~32MB after base64
+let lastImgSig = '';
+function blobSig(d: string): string { return d.length + '|' + d.slice(-256); }
+
+async function sendBlob(kind: string, dataUrl: string, extra: Record<string, any> = {}) {
+  const ch = channel;
+  if (ch?.readyState !== 'open' || dataUrl.length > MAX_BLOB_CHARS) return;
+  const id = 'b' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+  const total = Math.ceil(dataUrl.length / BLOB_CHUNK);
+  ch.send(JSON.stringify({ t: 'blob', id, kind, total, ...extra }));
+  for (let i = 0; i < total; i++) {
+    while (ch.bufferedAmount > 8 * 1024 * 1024) await new Promise((r) => setTimeout(r, 20));
+    if (ch.readyState !== 'open') return;
+    ch.send(JSON.stringify({ t: 'blobc', id, seq: i, d: dataUrl.slice(i * BLOB_CHUNK, (i + 1) * BLOB_CHUNK) }));
+  }
+}
+
+const incomingBlobs = new Map<string, { kind: string; total: number; parts: string[] }>();
+function handleBlobMsg(msg: any) {
+  if (msg.t === 'blob') {
+    incomingBlobs.set(msg.id, { kind: msg.kind, total: msg.total, parts: [] });
+    return;
+  }
+  const b = incomingBlobs.get(msg.id);
+  if (!b) return;
+  b.parts[msg.seq] = msg.d;
+  let have = 0; for (const p of b.parts) if (p !== undefined) have++;
+  if (have < b.total) return;
+  incomingBlobs.delete(msg.id);
+  const dataUrl = b.parts.join('');
+  if (b.kind === 'img') { lastImgSig = blobSig(dataUrl); window.warp.setClipboardImage(dataUrl); }
+}
+
+// Client clipboard image -> host.
+setInterval(async () => {
+  if (channel?.readyState !== 'open') return;
+  try {
+    const d = await window.warp.getClipboardImage();
+    if (d && blobSig(d) !== lastImgSig) { lastImgSig = blobSig(d); sendBlob('img', d); }
+  } catch { /* ignore */ }
+}, 2500);
+
+// Drag a file onto the viewer -> send it to the host (saved to its Downloads).
+window.addEventListener('dragover', (e) => { e.preventDefault(); });
+window.addEventListener('drop', async (e) => {
+  e.preventDefault();
+  const files = e.dataTransfer?.files;
+  if (!files || !files.length || channel?.readyState !== 'open') return;
+  for (const f of Array.from(files)) {
+    if (f.size > 32 * 1024 * 1024) { notify(`${f.name} is too large (max 32 MB)`); continue; }
+    notify(`Sending ${f.name}…`);
+    try {
+      const dataUrl: string = await new Promise((res, rej) => {
+        const r = new FileReader();
+        r.onload = () => res(String(r.result));
+        r.onerror = () => rej(new Error('read failed'));
+        r.readAsDataURL(f);
+      });
+      await sendBlob('file', dataUrl, { name: f.name });
+      notify(`Sent ${f.name} to host`);
+    } catch { notify(`Failed to send ${f.name}`); }
+  }
+});
+
+// Small transient toast in the viewer.
+let notifyTimer: ReturnType<typeof setTimeout> | undefined;
+function notify(msg: string) {
+  const el = document.getElementById('notify');
+  if (!el) return;
+  el.textContent = msg;
+  el.classList.add('show');
+  clearTimeout(notifyTimer);
+  notifyTimer = setTimeout(() => el.classList.remove('show'), 3000);
+}
 
 // ---------------------------------------------------------------------------
 // Overlay: stats + controls
