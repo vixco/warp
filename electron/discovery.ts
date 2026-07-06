@@ -15,6 +15,7 @@ export interface DiscoveredHost {
   port: number;
   platform: string;
   displays: number;
+  mac: string;      // primary LAN MAC, so a client can Wake-on-LAN it later
   lastSeen: number;
 }
 
@@ -42,12 +43,13 @@ export class Discovery {
           port: Number(msg.port) || 9750,
           platform: String(msg.platform || '?'),
           displays: Number(msg.displays) || 1,
+          mac: String(msg.mac || ''),
           lastSeen: Date.now(),
         };
         const prev = this.hosts.get(host.hostId);
         this.hosts.set(host.hostId, host);
         if (!prev || prev.ip !== host.ip || prev.name !== host.name ||
-            prev.displays !== host.displays) {
+            prev.displays !== host.displays || prev.mac !== host.mac) {
           this.emitHosts();
         }
       } catch { /* not ours */ }
@@ -119,4 +121,38 @@ export function primaryLanIp(): string {
     }
   }
   return '127.0.0.1';
+}
+
+// MAC of the primary LAN interface, so clients can remember it and wake this
+// host later even after it has gone to sleep (and stopped announcing).
+export function primaryMac(): string {
+  for (const ifaces of Object.values(os.networkInterfaces())) {
+    for (const iface of ifaces || []) {
+      if (iface.family === 'IPv4' && !iface.internal &&
+          iface.mac && iface.mac !== '00:00:00:00:00:00') return iface.mac;
+    }
+  }
+  return '';
+}
+
+// Send a Wake-on-LAN "magic packet" (6×0xFF + 16×MAC) as a UDP broadcast on the
+// usual WoL ports. The target is asleep and has no ARP entry, so it must be a
+// broadcast, not a unicast to its last IP.
+export function sendWakeOnLan(mac: string): boolean {
+  const hex = (mac || '').replace(/[^0-9a-fA-F]/g, '');
+  if (hex.length !== 12) return false;
+  const macBytes = Buffer.from(hex, 'hex');
+  const packet = Buffer.alloc(6 + 16 * 6, 0xff);
+  for (let i = 0; i < 16; i++) macBytes.copy(packet, 6 + i * 6);
+  const sock = dgram.createSocket({ type: 'udp4', reuseAddr: true });
+  sock.on('error', () => { try { sock.close(); } catch { /* ignore */ } });
+  sock.bind(() => {
+    try { sock.setBroadcast(true); } catch { /* ignore */ }
+    for (const addr of broadcastAddresses()) {
+      sock.send(packet, 9, addr, () => { /* best effort */ });
+      sock.send(packet, 7, addr, () => { /* best effort */ });
+    }
+    setTimeout(() => { try { sock.close(); } catch { /* ignore */ } }, 600);
+  });
+  return true;
 }

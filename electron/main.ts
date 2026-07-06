@@ -8,7 +8,7 @@ import * as os from 'os';
 import * as crypto from 'crypto';
 import { autoUpdater } from 'electron-updater';
 import { NativeHelpers } from './helpers';
-import { Discovery, DiscoveredHost, primaryLanIp } from './discovery';
+import { Discovery, DiscoveredHost, primaryLanIp, primaryMac, sendWakeOnLan } from './discovery';
 import { HostServer, DisplayInfo, generatePairingCode, safeEqualCode } from './signaling';
 
 const RENDERER = path.join(__dirname, '..', 'renderer');
@@ -279,6 +279,7 @@ async function startHosting(): Promise<{ ok: boolean; error?: string }> {
     port: settings.port,
     platform: process.platform,
     displays: screen.getAllDisplays().length,
+    mac: primaryMac(),
   }));
   settings.hostingEnabled = true;
   saveSettings();
@@ -663,6 +664,9 @@ function wireIpc() {
   ipcMain.handle('stop-hosting', () => stopHosting());
 
   ipcMain.handle('get-discovered-hosts', () => discovery.getHosts());
+  // Wake a sleeping host by broadcasting a Wake-on-LAN magic packet to its MAC
+  // (remembered by the client from a previous discovery).
+  ipcMain.handle('wake-host', (_e, mac: string) => sendWakeOnLan(String(mac || '')));
 
   ipcMain.handle('get-local-displays', () =>
     screen.getAllDisplays().map((d, i) => ({

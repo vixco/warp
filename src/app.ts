@@ -947,40 +947,83 @@ const hostEngine = new HostEngine();
 // ---------------------------------------------------------------------------
 // Computers page (client side)
 
-interface HostEntry { hostId: string; name: string; ip: string; port: number; platform: string; displays: number }
+interface HostEntry { hostId: string; name: string; ip: string; port: number; platform: string; displays: number; mac?: string }
+interface KnownHost { name: string; mac: string; platform: string; ip: string; port: number }
 
-function renderHosts(hosts: HostEntry[]) {
+// Remember every host we've seen (with its MAC) so we can still show it — and
+// Wake-on-LAN it — after it goes to sleep and stops announcing.
+function loadKnownHosts(): Record<string, KnownHost> {
+  try { return JSON.parse(localStorage.getItem('warp:knownHosts') || '{}'); } catch { return {}; }
+}
+function rememberHosts(live: HostEntry[]) {
+  const known = loadKnownHosts();
+  for (const h of live) {
+    if (h.mac) known[h.hostId] = { name: h.name, mac: h.mac, platform: h.platform, ip: h.ip, port: h.port };
+  }
+  try { localStorage.setItem('warp:knownHosts', JSON.stringify(known)); } catch { /* ignore */ }
+}
+
+function makeHostCard(name: string, meta: string, offline: boolean): HTMLDivElement {
+  const card = document.createElement('div');
+  card.className = 'computer-card';
+  if (offline) { card.style.opacity = '0.6'; }
+  card.innerHTML = `
+    <div class="screen-art">🖥</div>
+    <div class="name"></div>
+    <div class="meta"></div>
+    <div class="card-actions" style="margin-top: 10px; display: flex; justify-content: flex-end; gap: 8px;">
+      <button class="btn secondary small configure-btn" style="display: none;">Configure</button>
+      <button class="btn secondary small wake-btn" style="display: none;">Wake</button>
+    </div>`;
+  card.querySelector('.name')!.textContent = name;
+  card.querySelector('.meta')!.textContent = meta;
+  return card;
+}
+
+function renderHosts(live: HostEntry[]) {
+  rememberHosts(live);
   const grid = $('#computersGrid');
   grid.innerHTML = '';
-  $('#computersEmpty').style.display = hosts.length ? 'none' : 'block';
-  for (const h of hosts) {
-    const card = document.createElement('div');
-    card.className = 'computer-card';
-    card.innerHTML = `
-      <div class="screen-art">🖥</div>
-      <div class="name"></div>
-      <div class="meta"></div>
-      <div class="card-actions" style="margin-top: 10px; display: flex; justify-content: flex-end; gap: 8px;">
-        <button class="btn secondary small configure-btn" style="display: none;">Configure</button>
-      </div>`;
-    card.querySelector('.name')!.textContent = h.name;
-    card.querySelector('.meta')!.textContent =
-      `${h.ip} · ${h.displays} display(s) · ${h.platform === 'darwin' ? 'macOS' : h.platform}`;
-    
-    const isPaired = localStorage.getItem(`paired:${h.hostId}`) === '1';
+  const onlineIds = new Set(live.map((h) => h.hostId));
+
+  for (const h of live) {
+    const card = makeHostCard(
+      h.name,
+      `${h.ip} · ${h.displays} display(s) · ${h.platform === 'darwin' ? 'macOS' : h.platform}`,
+      false);
     const configBtn = card.querySelector('.configure-btn') as HTMLButtonElement;
-    if (isPaired && configBtn) {
+    if (localStorage.getItem(`paired:${h.hostId}`) === '1') {
       configBtn.style.display = 'inline-flex';
       configBtn.addEventListener('click', (e) => {
-        e.preventDefault();
-        e.stopPropagation();
+        e.preventDefault(); e.stopPropagation();
         openConnectModal(h.ip, h.port, h.name, h.hostId, true);
       });
     }
-
     card.addEventListener('click', () => openConnectModal(h.ip, h.port, h.name, h.hostId, false));
     grid.appendChild(card);
   }
+
+  // Offline hosts we've paired with before and can wake: show greyed, with a
+  // Wake button that broadcasts the magic packet to the remembered MAC.
+  const known = loadKnownHosts();
+  const offline = Object.entries(known).filter(([id, k]) =>
+    !onlineIds.has(id) && k.mac && localStorage.getItem(`paired:${id}`) === '1');
+  for (const [id, k] of offline) {
+    const card = makeHostCard(
+      k.name, `Asleep · ${k.platform === 'darwin' ? 'macOS' : k.platform}`, true);
+    const wakeBtn = card.querySelector('.wake-btn') as HTMLButtonElement;
+    wakeBtn.style.display = 'inline-flex';
+    wakeBtn.addEventListener('click', async (e) => {
+      e.preventDefault(); e.stopPropagation();
+      wakeBtn.disabled = true; wakeBtn.textContent = 'Waking…';
+      const ok = await warp.wakeHost(k.mac);
+      toast(ok ? `Wake signal sent to ${k.name}` : 'Could not send wake signal', !ok);
+      setTimeout(() => { wakeBtn.disabled = false; wakeBtn.textContent = 'Wake'; }, 4000);
+    });
+    grid.appendChild(card);
+  }
+
+  $('#computersEmpty').style.display = (live.length + offline.length) ? 'none' : 'block';
 }
 
 warp.onDiscoveredHosts(renderHosts);

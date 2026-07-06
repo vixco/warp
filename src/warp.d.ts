@@ -23,6 +23,7 @@ export interface WarpApi {
   requestCursorSnapshot(): void;
   getDiscoveredHosts(): Promise<any[]>;
   onDiscoveredHosts(fn: (hosts: any[]) => void): void;
+  wakeHost(mac: string): Promise<boolean>;
   getLocalDisplays(): Promise<any[]>;
   openViewers(args: any): Promise<boolean>;
   viewerClose(): void;

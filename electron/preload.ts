@@ -39,6 +39,7 @@ contextBridge.exposeInMainWorld('warp', {
   getDiscoveredHosts: () => ipcRenderer.invoke('get-discovered-hosts'),
   onDiscoveredHosts: (fn: (hosts: any[]) => void) =>
     ipcRenderer.on('discovered-hosts', (_e, hosts) => fn(hosts)),
+  wakeHost: (mac: string) => ipcRenderer.invoke('wake-host', mac),
   getLocalDisplays: () => ipcRenderer.invoke('get-local-displays'),
   openViewers: (args: any) => ipcRenderer.invoke('open-viewers', args),
 
