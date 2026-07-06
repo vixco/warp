@@ -182,6 +182,15 @@
   <div class="menu hidden" id="menu">
     <div class="menu-title">⚡ <span id="menuLabel">Warp</span></div>
     <div class="menu-stats" id="menuStats">—</div>
+    <!-- live diagnostics: rolling bitrate / fps / rtt over the last ~2 min -->
+    <canvas id="diagGraph" width="316" height="66"
+            style="width:100%;height:66px;display:block;margin:0 0 6px;
+                   background:#0c1018;border:1px solid #263042;border-radius:8px"></canvas>
+    <div class="menu-stats" style="margin-bottom:14px;display:flex;gap:14px">
+      <span style="color:#4f7cff">■ Mbps</span>
+      <span style="color:#39d98a">■ fps</span>
+      <span style="color:#ffb020">■ rtt</span>
+    </div>
     <div class="menu-row">
       <label>Max bitrate</label>
       <select id="menuBitrate">

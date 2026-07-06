@@ -853,6 +853,10 @@ setInterval(async () => {
         (nackRate > 0 ? ` · nack ${nackRate}/s` : '')
       : '';
     document.getElementById('menuStats')!.textContent = statsText + decoderText + netText;
+    // Feed the live diagnostics graph (drawn only while the menu is open).
+    diagHist.push({ mbps: kbps / 1000, fps, rtt: rttMs >= 0 ? rttMs : 0 });
+    if (diagHist.length > 120) diagHist.shift();
+    if (menuOpen) drawDiag();
     if (params.has('debug')) {
       console.log(`warp-stats ${JSON.stringify(
         { w, h, fps, kbps, rttMs, audioBytes, decoder, hwDecode, jbMs, procMs, dropped,
@@ -860,6 +864,33 @@ setInterval(async () => {
     }
   } catch { /* ignore */ }
 }, 1000);
+
+// Live diagnostics graph in the in-stream menu: rolling bitrate / fps / rtt over
+// the last ~2 minutes, each normalized to its own scale so you can see trends
+// (e.g. bitrate sawtooth = WiFi oscillation, fps dips, rtt spikes) at a glance.
+const diagHist: { mbps: number; fps: number; rtt: number }[] = [];
+function drawDiag() {
+  const c = document.getElementById('diagGraph') as HTMLCanvasElement | null;
+  const ctx = c?.getContext('2d');
+  if (!c || !ctx) return;
+  const W = c.width, H = c.height, pad = 4, n = diagHist.length;
+  ctx.clearRect(0, 0, W, H);
+  if (n < 2) return;
+  const line = (key: 'mbps' | 'fps' | 'rtt', color: string, floorMax: number) => {
+    let max = floorMax;
+    for (const d of diagHist) if (d[key] > max) max = d[key];
+    ctx.strokeStyle = color; ctx.lineWidth = 1.5; ctx.beginPath();
+    diagHist.forEach((d, i) => {
+      const x = pad + (i / (n - 1)) * (W - 2 * pad);
+      const y = H - pad - (d[key] / max) * (H - 2 * pad);
+      i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+    });
+    ctx.stroke();
+  };
+  line('mbps', '#4f7cff', 10);
+  line('fps', '#39d98a', 60);
+  line('rtt', '#ffb020', 50);
+}
 
 // Reveal the top control bar only after the pointer has DWELT in the top zone
 // for a few seconds, so merely moving the cursor up to the top edge (e.g. to
