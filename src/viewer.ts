@@ -477,6 +477,18 @@ const LOCAL_HOTKEYS = new Set(['KeyQ', 'KeyF', 'KeyM']);
 // becomes the Mac's ⌘ (their shortcuts "just work") and the Mac's Control moves
 // to the Windows key — so nothing is lost, only relabeled. Toggle in the menu.
 let ctrlCmdSwap = localStorage.getItem('kbd:swap') !== '0';
+
+// Alt+Tab (Windows app switcher) is translated to ⌘+Tab (the macOS app switcher):
+// hold Alt / tap Tab / release Alt is the same gesture as hold ⌘ / tap Tab /
+// release ⌘. This tracks whether such a switch is in progress so the held Alt is
+// presented to the host as ⌘ (Option+Tab does nothing on a Mac).
+let altTab = false;
+
+// Whether OS-reserved keys (Windows/⌘ key, Alt+Tab, Ctrl+W…) are captured and
+// forwarded to the host instead of firing on this PC. See the Keyboard Lock
+// block below; toggled from the in-stream menu ("System keys").
+let captureSystem = localStorage.getItem('kbd:capture') !== '0';
+
 function remapCode(code: string): string {
   if (!ctrlCmdSwap) return code;
   switch (code) {
@@ -492,16 +504,33 @@ window.addEventListener('keydown', (e) => {
   // Local hotkeys (Ctrl+Shift or Win/Cmd+Shift): Q disconnect, F fullscreen,
   // M in-stream menu — Parsec-style. Checked BEFORE remap, so Ctrl+Shift+Q
   // always disconnects locally and can never reach the Mac as ⌘+Shift+Q (logout).
+  // They still fire while every key is OS-locked (Keyboard Lock delivers the
+  // event to the page), so this is a guaranteed escape hatch — capturing the
+  // Windows key and Alt+Tab can never trap you in a session.
   if ((e.ctrlKey || e.metaKey) && e.shiftKey && LOCAL_HOTKEYS.has(e.code)) {
     e.preventDefault();
     if (e.code === 'KeyQ') disconnect();
-    if (e.code === 'KeyF') window.warp.viewerToggleFullscreen();
+    if (e.code === 'KeyF') toggleFullscreen();
     if (e.code === 'KeyM') toggleMenu();
     return;
   }
   if (menuOpen) {
     if (e.code === 'Escape') { e.preventDefault(); toggleMenu(false); }
     return; // don't forward keys while the menu is open
+  }
+  // Windows Alt+Tab -> macOS ⌘+Tab. Hold Alt / tap Tab / release Alt is the same
+  // motion as ⌘+Tab, so while switching we present the held Alt to the host as ⌘.
+  // Without this Alt+Tab lands as Option+Tab on the Mac, which does nothing.
+  if (e.code === 'Tab' && e.altKey && !e.ctrlKey && !e.metaKey) {
+    e.preventDefault();
+    if (!altTab) {
+      altTab = true;
+      sendInput({ t: 'ku', code: 'AltLeft' });   // drop the Option the physical
+      sendInput({ t: 'ku', code: 'AltRight' });  // Alt already put down on the host…
+      sendInput({ t: 'kd', code: 'MetaLeft', r: 0 }); // …and hold ⌘ in its place
+    }
+    sendInput({ t: 'kd', code: 'Tab', r: e.repeat ? 1 : 0 });
+    return;
   }
   e.preventDefault();
   sendInput({ t: 'kd', code: remapCode(e.code), r: e.repeat ? 1 : 0 });
@@ -510,34 +539,61 @@ window.addEventListener('keydown', (e) => {
 window.addEventListener('keyup', (e) => {
   if (menuOpen) return;
   e.preventDefault();
+  // During an Alt+Tab->⌘+Tab switch: a Tab release just lifts Tab (⌘ stays
+  // down); releasing Alt commits the switch by lifting the ⌘ we substituted.
+  if (altTab && e.code === 'Tab') { sendInput({ t: 'ku', code: 'Tab' }); return; }
+  if (altTab && (e.code === 'AltLeft' || e.code === 'AltRight')) {
+    altTab = false;
+    sendInput({ t: 'ku', code: 'MetaLeft' });
+    return;
+  }
   // Remap keyup with the SAME rule as keydown, else the host's modifier flag
   // (⌘/Control) would stay stuck after a swapped key is released.
   sendInput({ t: 'ku', code: remapCode(e.code) });
 });
 
 // Release all keys/buttons on host when this window loses focus.
-window.addEventListener('blur', () => { dragging = false; sendInput({ t: 'reset' }); });
+window.addEventListener('blur', () => { dragging = false; altTab = false; sendInput({ t: 'reset' }); });
 
-// Capture the Windows / Meta key so it reaches the host as Cmd instead of
-// popping the Windows Start menu (which also steals focus, tripping the blur
-// reset above and dropping the modifier). Keyboard Lock only intercepts
-// OS-reserved keys while the page is in *JavaScript-initiated* fullscreen —
-// Electron's window-level `fullscreen: true` does NOT satisfy that — so we must
-// enter the Fullscreen API first. requestFullscreen needs a transient user
-// gesture, so the first pointerdown / keydown kicks it off; we re-assert on
-// fullscreenchange and on focus (the lock is released whenever the window loses
-// focus). Scoped to the Meta keys so Escape / Alt+Tab keep their local meaning
-// and the user can never get trapped.
-async function lockKeyboard() {
+// Capture OS-reserved keys — the Windows/Meta key (else it pops the local Start
+// menu and steals focus), Alt+Tab, Ctrl+W, etc. — so they reach the host instead
+// of firing on this PC. The Keyboard Lock API only intercepts them while the page
+// is in *JavaScript-initiated* fullscreen; Electron's window-level
+// `fullscreen: true` does NOT satisfy that, so we enter the Fullscreen API
+// ourselves. requestFullscreen needs a transient user gesture, so the first
+// pointerdown / keydown kicks it off and we re-assert on focus and
+// fullscreenchange. Locking *every* key is safe: the Ctrl+Shift+Q/F/M hotkeys are
+// handled before forwarding (and still fire under the lock), and press-and-hold
+// Escape always releases it — so you can never get trapped.
+let capturePending = false;
+async function ensureCapture() {
+  if (!captureSystem || capturePending) return;
+  capturePending = true;
   try {
     if (!document.fullscreenElement) await document.documentElement.requestFullscreen();
-    await navigator.keyboard?.lock(['MetaLeft', 'MetaRight']);
+    await navigator.keyboard?.lock(); // no args = every capturable key
   } catch { /* unsupported, or no user activation yet — retried on next gesture */ }
+  finally { capturePending = false; }
 }
-window.addEventListener('pointerdown', lockKeyboard, { once: true });
-window.addEventListener('keydown', lockKeyboard, { once: true });
-document.addEventListener('fullscreenchange', lockKeyboard);
-window.addEventListener('focus', lockKeyboard);
+function releaseCapture() {
+  try { navigator.keyboard?.unlock?.(); } catch { /* ignore */ }
+}
+window.addEventListener('pointerdown', ensureCapture, { once: true });
+window.addEventListener('keydown', ensureCapture, { once: true });
+window.addEventListener('focus', ensureCapture);
+document.addEventListener('fullscreenchange', () => { if (document.fullscreenElement) ensureCapture(); });
+
+// The window is created fullscreen; every fullscreen toggle (Ctrl+Shift+F and
+// the two buttons) goes through here so key capture is re-armed on the way back
+// into fullscreen and dropped on the way out — otherwise, since window-level
+// fullscreen doesn't re-enter JS fullscreen, the lock would be lost after a
+// toggle and the Windows key would start leaking to this PC again.
+let windowFs = true;
+function toggleFullscreen() {
+  window.warp.viewerToggleFullscreen();
+  windowFs = !windowFs;
+  if (windowFs) ensureCapture(); else releaseCapture();
+}
 
 // ---------------------------------------------------------------------------
 // Clipboard: client -> host
@@ -638,8 +694,7 @@ function notify(msg: string) {
 // Overlay: stats + controls
 
 document.getElementById('ovDisconnect')!.addEventListener('click', disconnect);
-document.getElementById('ovFullscreen')!.addEventListener('click', () =>
-  window.warp.viewerToggleFullscreen());
+document.getElementById('ovFullscreen')!.addEventListener('click', () => toggleFullscreen());
 document.getElementById('ovSettings')!.addEventListener('click', () => toggleMenu(true));
 
 function disconnect() {
@@ -722,6 +777,17 @@ menuKbd.addEventListener('change', () => {
   notify(ctrlCmdSwap ? 'Ctrl now acts as ⌘' : 'Keyboard: native (Ctrl = Control)');
 });
 
+const menuSysKeys = document.getElementById('menuSysKeys') as HTMLSelectElement;
+menuSysKeys.value = captureSystem ? 'on' : 'off';
+menuSysKeys.addEventListener('change', () => {
+  captureSystem = menuSysKeys.value === 'on';
+  localStorage.setItem('kbd:capture', captureSystem ? '1' : '0');
+  altTab = false;
+  sendInput({ t: 'reset' }); // release any held keys before the capture mode flips
+  if (captureSystem) ensureCapture(); else releaseCapture();
+  notify(captureSystem ? 'Windows key & Alt+Tab now go to the host' : 'System keys stay on this PC');
+});
+
 function toggleMenu(open = !menuOpen) {
   menuOpen = open;
   menuEl.classList.toggle('hidden', !menuOpen);
@@ -730,6 +796,7 @@ function toggleMenu(open = !menuOpen) {
   // underneath it; the next pointer move near the top re-reveals the bar.
   overlay.classList.remove('show');
   if (menuOpen) {
+    altTab = false;
     sendInput({ t: 'reset' }); // release held keys/buttons
     populateAudioDevices();
   }
@@ -798,8 +865,7 @@ window.warp.onApplyCfg((cfg: any) => {
   }
 });
 
-document.getElementById('menuFullscreen')!.addEventListener('click', () =>
-  window.warp.viewerToggleFullscreen());
+document.getElementById('menuFullscreen')!.addEventListener('click', () => toggleFullscreen());
 document.getElementById('menuResume')!.addEventListener('click', () => toggleMenu(false));
 document.getElementById('menuDisconnect')!.addEventListener('click', disconnect);
 
