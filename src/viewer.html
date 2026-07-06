@@ -31,6 +31,14 @@
       z-index: 5;
     }
     .status.hidden { display: none; }
+    /* Brief reconnects: don't paint the opaque panel — let the last decoded
+       frame stay frozen behind a small pill so a WiFi hiccup doesn't flash black. */
+    .status.reconnecting { background: transparent; }
+    .status.reconnecting .msg {
+      background: rgba(16, 20, 28, 0.82);
+      padding: 7px 16px; border-radius: 999px;
+      -webkit-backdrop-filter: blur(6px); backdrop-filter: blur(6px);
+    }
     .status .spinner {
       width: 34px; height: 34px;
       border: 3px solid #263042;

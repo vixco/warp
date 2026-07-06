@@ -56,8 +56,12 @@ let channel: RTCDataChannel | null = null;       // reliable: keys, clicks, clip
 let fastChannel: RTCDataChannel | null = null;   // unreliable: continuous mouse move
 let sessionEnded = false;
 
-function showStatus(msg: string, retry = false) {
+// reconnecting = keep the last decoded frame visible behind a small pill instead
+// of covering everything with the opaque dark panel, so a brief network hiccup
+// freezes the picture rather than flashing black (much smoother on WiFi).
+function showStatus(msg: string, retry = false, reconnecting = false) {
   statusEl.classList.remove('hidden');
+  statusEl.classList.toggle('reconnecting', reconnecting);
   statusMsg.textContent = msg;
   statusSpinner.style.display = retry ? 'none' : 'block';
   statusRetry.style.display = retry ? 'block' : 'none';
@@ -65,6 +69,7 @@ function showStatus(msg: string, retry = false) {
 
 function hideStatus() {
   statusEl.classList.add('hidden');
+  statusEl.classList.remove('reconnecting');
 }
 
 function cleanup() {
@@ -130,7 +135,7 @@ function connect() {
 
   sock.onclose = () => {
     if (sessionEnded) return;
-    showStatus('Connection lost. Reconnecting…');
+    showStatus('Reconnecting…', false, true);
     setTimeout(() => { if (!sessionEnded) connect(); }, 2000);
   };
   sock.onerror = () => { /* onclose follows */ };
@@ -207,7 +212,7 @@ async function acceptOffer(sdp: string) {
       pc.getReceivers().forEach(applyReceiverLatency);
     }
     if (['failed', 'disconnected'].includes(pc.connectionState) && !sessionEnded) {
-      showStatus('Stream interrupted. Reconnecting…');
+      showStatus('Reconnecting…', false, true);
       setTimeout(() => { if (!sessionEnded) connect(); }, 1500);
     }
   };
