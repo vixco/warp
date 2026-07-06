@@ -87,6 +87,7 @@ interface Settings {
   audioEnabled: boolean;
   audioSource: string;   // 'auto' = system loopback, else input deviceId
   micSink: string;       // where client mic plays on the host ('default' or deviceId)
+  mainWindowBounds: { x: number; y: number; width: number; height: number } | null;
 }
 
 const settingsFile = () => path.join(app.getPath('userData'), 'settings.json');
@@ -112,6 +113,7 @@ function loadSettings(): Settings {
     audioEnabled: true,
     audioSource: 'auto',
     micSink: 'default',
+    mainWindowBounds: null,
   };
   try {
     return { ...defaults, ...JSON.parse(fs.readFileSync(settingsFile(), 'utf8')) };
@@ -477,10 +479,32 @@ function createTray() {
 // ---------------------------------------------------------------------------
 // Windows
 
+// Is this saved window rect still usable — i.e. does a meaningful part of it sit
+// on some currently-connected display? A monitor that was present when we saved
+// may be gone a day later; restoring a window onto coordinates that no longer
+// exist would open it off-screen where the user can't reach it.
+function boundsAreVisible(b: { x: number; y: number; width: number; height: number }): boolean {
+  return screen.getAllDisplays().some((d) => {
+    const wa = d.workArea;
+    const ix = Math.max(b.x, wa.x);
+    const iy = Math.max(b.y, wa.y);
+    const ax = Math.min(b.x + b.width, wa.x + wa.width);
+    const ay = Math.min(b.y + b.height, wa.y + wa.height);
+    // Require at least a ~120px visible corner so the title bar can be grabbed.
+    return ax - ix > 120 && ay - iy > 120;
+  });
+}
+
 function createMainWindow(show = true) {
+  // Restore the last window position/size when it still lands on a live display,
+  // so Warp reopens exactly where the user left it (part of "remember where the
+  // windows were"). Otherwise fall back to a default centered window.
+  const saved = settings.mainWindowBounds;
+  const useSaved = saved && boundsAreVisible(saved);
   mainWindow = new BrowserWindow({
-    width: 1120,
-    height: 720,
+    ...(useSaved
+      ? { x: saved!.x, y: saved!.y, width: saved!.width, height: saved!.height }
+      : { width: 1120, height: 720 }),
     minWidth: 880,
     minHeight: 560,
     title: 'Warp',
@@ -496,6 +520,24 @@ function createMainWindow(show = true) {
     },
   });
   mainWindow.loadFile(path.join(RENDERER, 'index.html'));
+
+  // Remember the window's position/size as the user moves or resizes it. Debounced
+  // so a drag doesn't hammer the settings file; only normal (non-max/min) bounds
+  // are stored so we restore to a real, grabbable rectangle.
+  let saveBoundsTimer: ReturnType<typeof setTimeout> | null = null;
+  const rememberBounds = () => {
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    if (mainWindow.isMinimized() || mainWindow.isMaximized() || mainWindow.isFullScreen()) return;
+    const b = mainWindow.getBounds();
+    if (saveBoundsTimer) clearTimeout(saveBoundsTimer);
+    saveBoundsTimer = setTimeout(() => {
+      settings.mainWindowBounds = { x: b.x, y: b.y, width: b.width, height: b.height };
+      saveSettings();
+    }, 400);
+  };
+  mainWindow.on('move', rememberBounds);
+  mainWindow.on('resize', rememberBounds);
+
   // Closing the window keeps Warp alive in the tray (Parsec-style); quit via
   // the tray menu.
   mainWindow.on('close', (e) => {

@@ -227,6 +227,7 @@ interface HostSession {
   sender: RTCRtpSender | null;
   track: MediaStreamTrack | null;
   captureHeight: number;               // physical capture height, for resolution scaling
+  reqBitrate: number;                  // this screen's requested ceiling (Mbps), pre-sharing
   audioStream: MediaStream | null;   // system audio being sent to the client
   micPlayer: HTMLAudioElement | null; // client microphone played on the host
 }
@@ -246,6 +247,37 @@ class HostEngine {
     const run = this.captureLock.then(fn, fn);
     this.captureLock = run.catch(() => { /* keep the chain alive on failure */ });
     return run;
+  }
+
+  // Every viewer monitor opens its own PeerConnection, but they all share ONE
+  // physical link, encoder and (client) decoder. Left alone, three streams each
+  // ramp toward the full user ceiling with no knowledge of each other; their
+  // independent congestion controllers then fight over the same WiFi, and
+  // whichever ramps last (the 3rd screen) loses the race — its bitrate collapses
+  // and latency spikes. That is the "3e monitor lagt heeel erg". So we treat the
+  // configured ceiling as a budget SHARED across the active screens: each screen
+  // gets its requested ceiling divided by the number of live screens, keeping the
+  // aggregate near the single-stream ceiling instead of N× it. A floor prevents a
+  // many-monitor split from starving any one screen into mush.
+  private static readonly PER_STREAM_FLOOR_MBPS = 8;
+  private perStreamBitrateMbps(s: HostSession): number {
+    const n = Math.max(1, this.sessions.size);
+    return Math.max(HostEngine.PER_STREAM_FLOOR_MBPS, Math.round(s.reqBitrate / n));
+  }
+
+  // Re-apply each live screen's shared bitrate ceiling. Called whenever the set
+  // of active screens changes (a monitor connects or disconnects), so the split
+  // widens back out the instant a screen closes and tightens when one joins.
+  private async rebalanceBitrates() {
+    for (const s of this.sessions.values()) {
+      if (!s.sender) continue;
+      try {
+        const params = s.sender.getParameters();
+        params.encodings = params.encodings?.length ? params.encodings : [{}];
+        params.encodings[0].maxBitrate = this.perStreamBitrateMbps(s) * 1_000_000;
+        await s.sender.setParameters(params);
+      } catch { /* a transient renegotiation can reject setParameters; next call fixes it */ }
+    }
   }
 
   constructor() {
@@ -371,7 +403,8 @@ class HostEngine {
     });
     const session: HostSession = {
       pc, stream, channel: null, fastChannel: null, displayId, sender: null, track,
-      captureHeight, audioStream: audioCapture, micPlayer: null,
+      captureHeight, reqBitrate: Number(msg.bitrate) || 150,
+      audioStream: audioCapture, micPlayer: null,
     };
     this.sessions.set(sessionId, session);
 
@@ -442,18 +475,22 @@ class HostEngine {
     // Tune the encoder's bitrate envelope in the SDP (see tuneVideoSdp): high
     // ceiling + high start for instant quality, low floor for minimal idle
     // bandwidth. Must happen before setLocalDescription so the local encoder
-    // picks it up.
-    const tunedSdp = tuneVideoSdp(offer.sdp || '', mbps);
+    // picks it up. The start-bitrate is divided by the number of live screens so
+    // three connecting monitors don't collectively burst 3× the link's capacity
+    // on the very first frames (which is what collapses the 3rd stream).
+    const tunedSdp = tuneVideoSdp(offer.sdp || '', mbps, this.sessions.size);
     await pc.setLocalDescription({ type: 'offer', sdp: tunedSdp });
     warp.toSession(sessionId, { type: 'rtc-offer', sdp: tunedSdp });
 
-    // Apply bitrate/framerate caps once connected.
+    // Apply bitrate/framerate caps once connected. maxBitrate is the SHARED
+    // per-screen slice (ceiling ÷ live screens), so the streams never fight for
+    // more than the link can carry.
     const sender = transceiver.sender;
     const applyParams = async () => {
       try {
         const params = sender.getParameters();
         params.encodings = params.encodings?.length ? params.encodings : [{}];
-        params.encodings[0].maxBitrate = mbps * 1_000_000;
+        params.encodings[0].maxBitrate = this.perStreamBitrateMbps(session) * 1_000_000;
         params.encodings[0].maxFramerate = fps;
         params.encodings[0].scaleResolutionDownBy = scaleFor(captureHeight, maxHeight);
         (params.encodings[0] as any).priority = 'high';
@@ -465,6 +502,11 @@ class HostEngine {
     pc.addEventListener('connectionstatechange', () => {
       if (pc.connectionState === 'connected') applyParams();
     });
+
+    // A new screen just joined the shared budget: tighten every already-running
+    // screen's slice now, so the aggregate stays within the link instead of
+    // over-committing until each stream happens to re-apply on its own.
+    this.rebalanceBitrates();
   }
 
   private onChannelMessage(sessionId: string, data: any) {
@@ -493,7 +535,12 @@ class HostEngine {
       if (s.sender) {
         const params = s.sender.getParameters();
         params.encodings = params.encodings?.length ? params.encodings : [{}];
-        if (cfg.bitrate) params.encodings[0].maxBitrate = Number(cfg.bitrate) * 1_000_000;
+        // Live bitrate change updates this screen's requested ceiling, then
+        // applies the SHARED slice so it still respects the multi-screen budget.
+        if (cfg.bitrate) {
+          s.reqBitrate = Number(cfg.bitrate) || s.reqBitrate;
+          params.encodings[0].maxBitrate = this.perStreamBitrateMbps(s) * 1_000_000;
+        }
         if (cfg.fps) params.encodings[0].maxFramerate = Number(cfg.fps);
         // Live resolution cap: fewer pixels to encode/transmit/decode is the
         // biggest latency lever on a high-DPI host.
@@ -542,6 +589,9 @@ class HostEngine {
     s.audioStream?.getTracks().forEach((t) => t.stop());
     if (s.micPlayer) { s.micPlayer.pause(); s.micPlayer.srcObject = null; }
     warp.injectInput({ t: 'reset' });
+    // A screen left the shared budget — widen the remaining screens' slices back
+    // out so a lone survivor gets the full ceiling again.
+    this.rebalanceBitrates();
   }
 
   stopAll() {
@@ -592,15 +642,18 @@ function degradationFor(mode: string): 'balanced' | 'maintain-framerate' {
 //     bandwidth stays minimal until motion or detail actually needs it.
 // The result: barely any bandwidth on a still screen, up to the full user cap
 // (e.g. 200 Mbps) the instant something moves, with no quality ramp delay.
-function tuneVideoSdp(sdp: string, maxMbps: number): string {
+function tuneVideoSdp(sdp: string, maxMbps: number, shareCount = 1): string {
   const maxKbps = Math.max(1000, Math.round(maxMbps * 1000));
   // Start high-but-safe, NOT at the full ceiling. Blasting e.g. 200 Mbps on the
   // very first frames bursts the link; if it can't sustain that, congestion
   // control collapses the bitrate and spikes latency for a second or two before
   // recovering — exactly the "laggy + low quality right when I connect" feel.
   // ~30 Mbps is already crisp for desktop/text immediately, and GCC climbs to
-  // the real ceiling within about a second on a link that can carry it.
-  const startKbps = Math.min(maxKbps, 30000);
+  // the real ceiling within about a second on a link that can carry it. With
+  // several screens connecting at once we divide the start burst between them so
+  // the combined first-frame burst still fits the link (no 3-monitor collapse).
+  const share = Math.max(1, shareCount);
+  const startKbps = Math.max(4000, Math.round(Math.min(maxKbps, 30000) / share));
   const minKbps = 500;                          // sip bandwidth when idle (VBR floor)
 
   const lines = sdp.split(/\r?\n/);
@@ -831,19 +884,24 @@ async function runConnect(code: string): Promise<void> {
 
     cm.localMonitors = await warp.getLocalDisplays();
 
-    // Check if we already have a saved mapping and are reconnecting without forcing configuration
+    // Reconnecting to a host we've configured before: restore the saved
+    // arrangement without asking. The saved mapping is resolved by monitor
+    // *identity* (attributes), not by array index or raw display id — both of
+    // which drift across a reboot — so "which monitor showed what" survives even
+    // a day later when macOS has reshuffled its display IDs. If nothing resolves
+    // (the whole setup changed), fall through to the mapping dialog.
     const saved = loadSavedMapping();
     const isReconnect = !code;
     if (saved && isReconnect && !forceConfigure) {
-      const slotsWithIndex = saved.slots.map((s, i) => ({
-        monIndex: i,
-        choice: s.choice,
-        res: s.res,
-        fps: s.fps,
-      }));
-      $('#cmSub').textContent = 'Starting streams…';
-      await startStreamingWithSlots(slotsWithIndex);
-      return;
+      const resolved = resolveSavedSlots(saved);
+      const slots = [...resolved.entries()]
+        .filter(([, v]) => v.choice !== 'none')
+        .map(([monIndex, v]) => ({ monIndex, choice: v.choice, res: v.res, fps: v.fps }));
+      if (slots.length) {
+        $('#cmSub').textContent = 'Starting streams…';
+        await startStreamingWithSlots(slots, false);
+        return;
+      }
     }
 
     $('#cmTitle').textContent = `Screens on ${welcome.hostName}`;
@@ -882,15 +940,158 @@ function fpsOptionsFor(refreshRate: number): number[] {
   return [...set].sort((a, b) => a - b);
 }
 
-interface SavedMapping { monCount: number; slots: { choice: string; res: string; fps: string }[] }
+// A saved mapping is stored per host. Each slot records BOTH the local monitor
+// it applies to and what that monitor should show — described by stable
+// attributes (label, resolution, position, primary) rather than the volatile
+// numeric ids that macOS/Windows reassign across reboots. That is what lets the
+// arrangement survive "a day later": we re-match by identity, not by id/index.
+interface MonRef { label: string; w: number; h: number; x: number; y: number; primary: boolean }
+interface HostRef {
+  id: number; label: string; width: number; height: number;
+  primary: boolean; virtual: boolean; refreshRate?: number;
+}
+// kind: 'host' = an existing host display (matched by attributes), 'new' = a
+// virtual display we recreate each session, 'none' = this monitor is unused.
+interface SavedSlot {
+  mon: MonRef;
+  kind: 'host' | 'new' | 'none';
+  host?: HostRef;
+  res: string;
+  fps: string;
+}
+interface SavedMapping { version: 2; slots: SavedSlot[] }
+
+function monRefOf(mon: any): MonRef {
+  return {
+    label: String(mon.label || ''),
+    w: mon.width, h: mon.height,
+    x: mon.bounds?.x ?? 0, y: mon.bounds?.y ?? 0,
+    primary: !!mon.primary,
+  };
+}
+
+// How strongly a saved local-monitor ref matches a current monitor. Same size is
+// the anchor; matching label and exact position add confidence so two identical
+// panels are told apart by where they sit.
+function scoreMon(a: MonRef, b: MonRef): number {
+  let s = 0;
+  if (a.label && a.label === b.label) s += 3;
+  if (a.w === b.w && a.h === b.h) s += 3;
+  if (a.x === b.x && a.y === b.y) s += 2;
+  if (a.primary === b.primary) s += 1;
+  return s;
+}
+
+// How strongly a saved host-display ref matches a current host display. Label is
+// the best signal (survives id churn); resolution anchors it; primary/refresh
+// break ties between identical panels.
+function scoreHost(ref: HostRef, d: RemoteDisplay): number {
+  let s = 0;
+  if (ref.label && ref.label === d.label) s += 4;
+  if (ref.width === d.width && ref.height === d.height) s += 3;
+  if (ref.primary === !!d.primary) s += 1;
+  if (ref.refreshRate && d.refreshRate && ref.refreshRate === d.refreshRate) s += 1;
+  return s;
+}
 
 function loadSavedMapping(): SavedMapping | null {
   try {
     const raw = localStorage.getItem(`map:${cm.hostId}`);
     if (!raw) return null;
-    const m = JSON.parse(raw) as SavedMapping;
-    return m.monCount === cm.localMonitors.length ? m : null;
+    const m = JSON.parse(raw);
+    if (m && m.version === 2 && Array.isArray(m.slots)) return m as SavedMapping;
+    // A pre-v2 mapping (index/id based). Upgrade it in place to the identity
+    // schema so existing users keep their arrangement without reconfiguring —
+    // as long as every slot is recoverable (virtual/unused, or a host display
+    // that's still present so we can capture its attributes). If any slot points
+    // at a physical display whose id is already stale, we can't recover its
+    // identity, so we bail to the mapping dialog for a one-time reconfigure.
+    return migrateLegacyMapping(m);
   } catch { return null; }
+}
+
+// Best-effort upgrade of the old { monCount, slots:[{choice,res,fps}] } mapping,
+// paired by index with the current monitors, to the stable v2 schema.
+function migrateLegacyMapping(old: any): SavedMapping | null {
+  if (!old || !Array.isArray(old.slots) || !old.slots.length) return null;
+  const slots: SavedSlot[] = [];
+  for (let i = 0; i < old.slots.length; i++) {
+    const s = old.slots[i];
+    const mon = cm.localMonitors[i];
+    if (!mon) continue; // fewer monitors now — drop the extra slot
+    const monRef = monRefOf(mon);
+    const res = s.res || 'auto';
+    const fps = s.fps || '60';
+    if (s.choice === 'none') { slots.push({ mon: monRef, kind: 'none', res, fps }); continue; }
+    if (s.choice === 'new') { slots.push({ mon: monRef, kind: 'new', res, fps }); continue; }
+    const d = cm.displays.find((dd) => String(dd.id) === String(s.choice));
+    if (!d) return null; // stale physical id, identity unrecoverable → reconfigure
+    slots.push({
+      mon: monRef, kind: 'host', res, fps,
+      host: { id: d.id, label: d.label, width: d.width, height: d.height,
+        primary: !!d.primary, virtual: !!d.virtual, refreshRate: d.refreshRate },
+    });
+  }
+  if (!slots.length) return null;
+  const migrated: SavedMapping = { version: 2, slots };
+  try { localStorage.setItem(`map:${cm.hostId}`, JSON.stringify(migrated)); } catch { /* ignore */ }
+  return migrated;
+}
+
+// Resolve a saved host reference to a concrete choice value for the current
+// session: a live host display's id, 'new' (recreate a virtual display), or
+// 'none' if the referenced physical display is simply gone. `used` holds the
+// host display ids already claimed by earlier slots, so two saved slots can't
+// both grab the same physical display (which would happen with two identical
+// unlabeled monitors) — the second falls through to the next-best match.
+function resolveHostChoice(slot: SavedSlot, used?: Set<number>): string {
+  if (slot.kind === 'new') return 'new';
+  if (slot.kind === 'none' || !slot.host) return 'none';
+  let best: RemoteDisplay | null = null;
+  let bestScore = 0;
+  for (const d of cm.displays) {
+    if (used?.has(d.id)) continue;
+    const sc = scoreHost(slot.host, d);
+    if (sc > bestScore) { bestScore = sc; best = d; }
+  }
+  if (best && bestScore >= 3) { // size- or label-level match
+    used?.add(best.id);
+    return String(best.id);
+  }
+  // The saved target is absent. A virtual display we made before can just be
+  // recreated; a real monitor that's unplugged is left unused.
+  return slot.host.virtual ? 'new' : 'none';
+}
+
+// Match each current local monitor to at most one saved slot by identity, then
+// translate that slot into { choice, res, fps }. Greedy on the strongest matches
+// first so two identical monitors don't steal each other's slot. Returns a map
+// keyed by the current monitor's index.
+function resolveSavedSlots(saved: SavedMapping): Map<number, { choice: string; res: string; fps: string }> {
+  const out = new Map<number, { choice: string; res: string; fps: string }>();
+  const pairs: { mi: number; si: number; score: number }[] = [];
+  cm.localMonitors.forEach((mon, mi) => {
+    const mref = monRefOf(mon);
+    saved.slots.forEach((slot, si) => {
+      const score = scoreMon(mref, slot.mon);
+      if (score >= 3) pairs.push({ mi, si, score }); // require at least size or label
+    });
+  });
+  pairs.sort((a, b) => b.score - a.score);
+  const usedMon = new Set<number>();
+  const usedSlot = new Set<number>();
+  const usedHostIds = new Set<number>();
+  for (const p of pairs) {
+    if (usedMon.has(p.mi) || usedSlot.has(p.si)) continue;
+    usedMon.add(p.mi); usedSlot.add(p.si);
+    const slot = saved.slots[p.si];
+    out.set(p.mi, {
+      choice: resolveHostChoice(slot, usedHostIds),
+      res: slot.res || 'auto',
+      fps: slot.fps || '60',
+    });
+  }
+  return out;
 }
 
 function renderMapRows() {
@@ -902,6 +1103,10 @@ function renderMapRows() {
   const prevFps = [...rows.querySelectorAll('select.sel-fps')]
     .map((s) => (s as HTMLSelectElement).value);
   const saved = prevChoice.length ? null : loadSavedMapping();
+  // Resolve the saved arrangement to THIS session's monitors/displays by
+  // identity, so the dialog pre-selects the same choices it will actually
+  // restore — even after ids/indices shifted overnight.
+  const resolved = saved ? resolveSavedSlots(saved) : null;
   rows.innerHTML = '';
 
   cm.localMonitors.forEach((mon, i) => {
@@ -947,13 +1152,16 @@ function renderMapRows() {
       fpsSelect.add(new Option(label, String(f)));
     }
 
-    // Restore: in-dialog state > saved mapping > default (all virtual, auto).
-    const wantedChoice = prevChoice[i] ?? saved?.slots[i]?.choice ?? 'new';
+    // Restore: in-dialog state > resolved saved mapping > default (all virtual,
+    // auto). The saved values are resolved by identity (resolveSavedSlots), so a
+    // reboot that renumbered displays still lands on the right choice here.
+    const rs = resolved?.get(i);
+    const wantedChoice = prevChoice[i] ?? rs?.choice ?? 'new';
     select.value = wantedChoice;
     if (select.value !== wantedChoice) select.value = 'new'; // stale display id
-    resSelect.value = prevRes[i] ?? saved?.slots[i]?.res ?? 'auto';
+    resSelect.value = prevRes[i] ?? rs?.res ?? 'auto';
     if (!resSelect.value) resSelect.value = 'auto';
-    fpsSelect.value = prevFps[i] ?? saved?.slots[i]?.fps ?? String(refreshRate);
+    fpsSelect.value = prevFps[i] ?? rs?.fps ?? String(refreshRate);
     if (!fpsSelect.value) fpsSelect.value = String(refreshRate);
 
     const syncResVisibility = () => {
@@ -987,7 +1195,10 @@ function createVdisplayOverWs(width: number, height: number, hz: number): Promis
   });
 }
 
-async function startStreamingWithSlots(slots: { monIndex: number; choice: string; res: string; fps: string }[]) {
+async function startStreamingWithSlots(
+  slots: { monIndex: number; choice: string; res: string; fps: string }[],
+  persist = true,
+) {
   const wanted = slots.filter((w) => w.choice !== 'none');
   if (!wanted.length) { toast('Select at least one screen', true); return; }
 
@@ -1023,11 +1234,29 @@ async function startStreamingWithSlots(slots: { monIndex: number; choice: string
     });
   }
 
-  // Remember this setup so the next connect restores it automatically.
-  localStorage.setItem(`map:${cm.hostId}`, JSON.stringify({
-    monCount: cm.localMonitors.length,
-    slots: slots.map(({ choice, res, fps }) => ({ choice, res, fps })),
-  } satisfies SavedMapping));
+  // Remember this setup so the next connect restores it automatically. Persist
+  // ALL rows (including unused ones) keyed by stable monitor identity, and record
+  // each chosen host display's attributes — never just its volatile id — so the
+  // arrangement can be re-matched after a reboot. (Skipped when we're merely
+  // replaying an already-saved mapping on auto-reconnect.)
+  if (persist) {
+    const savedSlots: SavedSlot[] = slots.map((s) => {
+      const mon = cm.localMonitors[s.monIndex];
+      const monRef = monRefOf(mon);
+      if (s.choice === 'none') return { mon: monRef, kind: 'none', res: s.res, fps: s.fps };
+      if (s.choice === 'new') return { mon: monRef, kind: 'new', res: s.res, fps: s.fps };
+      const d = cm.displays.find((dd) => String(dd.id) === s.choice);
+      const host: HostRef = d
+        ? { id: d.id, label: d.label, width: d.width, height: d.height,
+            primary: !!d.primary, virtual: !!d.virtual, refreshRate: d.refreshRate }
+        : { id: Number(s.choice), label: '', width: mon.width, height: mon.height,
+            primary: false, virtual: false };
+      return { mon: monRef, kind: 'host', host, res: s.res, fps: s.fps };
+    });
+    localStorage.setItem(`map:${cm.hostId}`, JSON.stringify({
+      version: 2, slots: savedSlots,
+    } satisfies SavedMapping));
+  }
 
   const code = localStorage.getItem(`code:${cm.hostId}`) || '';
   await warp.openViewers({ host: cm.host, port: cm.port, code, clientId: clientId(), screens });
