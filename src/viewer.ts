@@ -129,17 +129,32 @@ function connect() {
   sock.onerror = () => { /* onclose follows */ };
 }
 
+// How much receive-side buffer to hold, in ms. A hard-zero buffer renders every
+// frame the instant it arrives — lowest latency, but any network jitter then
+// shows up as uneven frame spacing (micro-stutter — the "gaar / niet smooth"
+// feel). "Smooth motion" trades a few ms of latency for an even cadence by
+// holding ~2.5 frames (clamped 20–50 ms, so even 165 fps buffers only ~20 ms).
+// "Sharp text" keeps zero for the crispest, most responsive pointer.
+function videoJbMs(): number {
+  if (P.mode !== 'smooth') return 0;
+  return Math.min(50, Math.max(20, Math.round(2500 / (P.fps || 60))));
+}
+function applyReceiverLatency(r: RTCRtpReceiver) {
+  // Only video is buffered for smoothness; audio always stays at zero delay.
+  const jb = r.track?.kind === 'video' ? videoJbMs() : 0;
+  try {
+    (r as any).jitterBufferTarget = jb;
+    (r as any).playoutDelayHint = jb / 1000;
+  } catch { /* best effort */ }
+}
+
 async function acceptOffer(sdp: string) {
   pc = new RTCPeerConnection({
     iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
   });
 
   pc.ontrack = (e) => {
-    // Parsec-style latency: no jitter buffering, render frames immediately.
-    try {
-      (e.receiver as any).jitterBufferTarget = 0;
-      (e.receiver as any).playoutDelayHint = 0;
-    } catch { /* best effort */ }
+    applyReceiverLatency(e.receiver);
     if (e.track.kind === 'audio') {
       audioEl.srcObject = e.streams[0] || new MediaStream([e.track]);
       applySink();
@@ -179,15 +194,10 @@ async function acceptOffer(sdp: string) {
     if (!pc) return;
     if (pc.connectionState === 'connected') {
       hideStatus();
-      // Re-assert zero playout delay on every receiver once negotiated — some
-      // Chromium versions reset the hint after the track is wired up, which
-      // silently re-introduces a jitter buffer (the "constant small delay").
-      pc.getReceivers().forEach((r) => {
-        try {
-          (r as any).jitterBufferTarget = 0;
-          (r as any).playoutDelayHint = 0;
-        } catch { /* best effort */ }
-      });
+      // Re-assert the playout-delay target on every receiver once negotiated —
+      // some Chromium versions reset the hint after the track is wired up, which
+      // would otherwise re-introduce Chromium's own (larger) default buffer.
+      pc.getReceivers().forEach(applyReceiverLatency);
     }
     if (['failed', 'disconnected'].includes(pc.connectionState) && !sessionEnded) {
       showStatus('Stream interrupted. Reconnecting…');
@@ -603,6 +613,9 @@ function sendCfg() {
   P.mode = menuMode.value;
   P.maxHeight = Number(menuRes.value);
   sendInput({ t: 'cfg', bitrate: P.bitrate, fps: P.fps, mode: P.mode, maxHeight: P.maxHeight });
+  // Picture mode / fps changed the buffer target — re-apply it live so switching
+  // to "Smooth motion" starts smoothing immediately (no reconnect needed).
+  pc?.getReceivers().forEach(applyReceiverLatency);
 }
 menuBitrate.addEventListener('change', sendCfg);
 menuFps.addEventListener('change', sendCfg);
