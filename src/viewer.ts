@@ -470,9 +470,26 @@ window.addEventListener('contextmenu', (e) => e.preventDefault());
 
 const LOCAL_HOTKEYS = new Set(['KeyQ', 'KeyF', 'KeyM']);
 
+// On a Windows keyboard driving a Mac, shortcut muscle-memory is Ctrl-based
+// (Ctrl+C/V/W/T…) but the Mac uses ⌘. Default: swap Ctrl↔Win so the user's Ctrl
+// becomes the Mac's ⌘ (their shortcuts "just work") and the Mac's Control moves
+// to the Windows key — so nothing is lost, only relabeled. Toggle in the menu.
+let ctrlCmdSwap = localStorage.getItem('kbd:swap') !== '0';
+function remapCode(code: string): string {
+  if (!ctrlCmdSwap) return code;
+  switch (code) {
+    case 'ControlLeft': return 'MetaLeft';
+    case 'ControlRight': return 'MetaRight';
+    case 'MetaLeft': return 'ControlLeft';
+    case 'MetaRight': return 'ControlRight';
+    default: return code;
+  }
+}
+
 window.addEventListener('keydown', (e) => {
   // Local hotkeys (Ctrl+Shift or Win/Cmd+Shift): Q disconnect, F fullscreen,
-  // M in-stream menu — Parsec-style.
+  // M in-stream menu — Parsec-style. Checked BEFORE remap, so Ctrl+Shift+Q
+  // always disconnects locally and can never reach the Mac as ⌘+Shift+Q (logout).
   if ((e.ctrlKey || e.metaKey) && e.shiftKey && LOCAL_HOTKEYS.has(e.code)) {
     e.preventDefault();
     if (e.code === 'KeyQ') disconnect();
@@ -485,13 +502,15 @@ window.addEventListener('keydown', (e) => {
     return; // don't forward keys while the menu is open
   }
   e.preventDefault();
-  sendInput({ t: 'kd', code: e.code, r: e.repeat ? 1 : 0 });
+  sendInput({ t: 'kd', code: remapCode(e.code), r: e.repeat ? 1 : 0 });
 });
 
 window.addEventListener('keyup', (e) => {
   if (menuOpen) return;
   e.preventDefault();
-  sendInput({ t: 'ku', code: e.code });
+  // Remap keyup with the SAME rule as keydown, else the host's modifier flag
+  // (⌘/Control) would stay stuck after a swapped key is released.
+  sendInput({ t: 'ku', code: remapCode(e.code) });
 });
 
 // Release all keys/buttons on host when this window loses focus.
@@ -691,6 +710,15 @@ function decodableCodecs(): Set<string> {
   menuCodec.value = allowed.includes(P.codec) ? P.codec : 'h264';
 })();
 menuRes.value = [0, 720, 1080, 1440].includes(P.maxHeight) ? String(P.maxHeight) : '1440';
+
+const menuKbd = document.getElementById('menuKbd') as HTMLSelectElement;
+menuKbd.value = ctrlCmdSwap ? 'swap' : 'native';
+menuKbd.addEventListener('change', () => {
+  ctrlCmdSwap = menuKbd.value === 'swap';
+  localStorage.setItem('kbd:swap', ctrlCmdSwap ? '1' : '0');
+  sendInput({ t: 'reset' }); // release any held modifiers so the swap can't stick a key
+  notify(ctrlCmdSwap ? 'Ctrl now acts as ⌘' : 'Keyboard: native (Ctrl = Control)');
+});
 
 function toggleMenu(open = !menuOpen) {
   menuOpen = open;
