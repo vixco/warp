@@ -201,6 +201,8 @@ function saveSettings() {
 const helpers = new NativeHelpers();
 const discovery = new Discovery();
 let mainWindow: BrowserWindow | null = null;
+let hostEngineRendererReady = false;
+const pendingEngineMessages: { sessionId: string; msg: any }[] = [];
 let tray: Tray | null = null;
 let isQuitting = false;
 let updateReadyVersion: string | null = null;
@@ -216,6 +218,20 @@ let lastClipboardText = '';
 // displayMediaRequestHandler. The renderer serializes captures, so a single
 // slot is race-free.
 let pendingCaptureDisplayId: number | null = null;
+
+// Host clients can reconnect faster than index.html finishes loading after a
+// launch/restart. Electron IPC sent before the renderer registers its listener
+// is not replayed, so queue signaling until HostEngine explicitly announces it
+// is ready. Otherwise all WebSockets look connected while every viewer remains
+// on "Starting stream…" forever.
+function sendToHostEngine(sessionId: string, msg: any) {
+  if (hostEngineRendererReady && mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('engine-message', { sessionId, msg });
+    return;
+  }
+  pendingEngineMessages.push({ sessionId, msg });
+  if (pendingEngineMessages.length > 512) pendingEngineMessages.shift();
+}
 
 // ---------------------------------------------------------------------------
 // Displays
@@ -285,13 +301,11 @@ async function startHosting(): Promise<{ ok: boolean; error?: string }> {
         clipboard.writeText(msg.text);
         return;
       }
-      mainWindow?.webContents.send('engine-message', { sessionId, msg });
+      sendToHostEngine(sessionId, msg);
     },
     onSessionClosed: (sessionId) => {
       helpers.injectInput({ t: 'reset' });
-      mainWindow?.webContents.send('engine-message', {
-        sessionId, msg: { type: 'stop-screen', sessionId },
-      });
+      sendToHostEngine(sessionId, { type: 'stop-screen', sessionId });
     },
     onClientsChanged: (count) => {
       pushHostState();
@@ -569,6 +583,7 @@ function boundsAreVisible(b: { x: number; y: number; width: number; height: numb
 }
 
 function createMainWindow(show = true) {
+  hostEngineRendererReady = false;
   // Restore the last window position/size when it still lands on a live display,
   // so Warp reopens exactly where the user left it (part of "remember where the
   // windows were"). Otherwise fall back to a default centered window.
@@ -619,7 +634,10 @@ function createMainWindow(show = true) {
       mainWindow?.hide();
     }
   });
-  mainWindow.on('closed', () => { mainWindow = null; });
+  mainWindow.on('closed', () => {
+    hostEngineRendererReady = false;
+    mainWindow = null;
+  });
 }
 
 let closingAllViewers = false;
@@ -706,6 +724,13 @@ function wireIpc() {
   // Cursor helper -> host renderer (host engine broadcasts it to the clients).
   helpers.onCursor = (m) => mainWindow?.webContents.send('cursor-update', m);
   ipcMain.on('request-cursor-snapshot', () => helpers.requestCursorSnapshot());
+  ipcMain.on('host-engine-ready', (e) => {
+    if (!mainWindow || mainWindow.isDestroyed() || e.sender !== mainWindow.webContents) return;
+    hostEngineRendererReady = true;
+    for (const item of pendingEngineMessages.splice(0)) {
+      mainWindow.webContents.send('engine-message', item);
+    }
+  });
 
   ipcMain.handle('get-host-state', () => hostState());
   ipcMain.handle('start-hosting', () => startHosting());

@@ -238,6 +238,7 @@ interface HostSession {
   reqBitrate: number;                  // this screen's requested ceiling (Mbps), pre-sharing
   audioStream: MediaStream | null;   // system audio being sent to the client
   micPlayer: HTMLAudioElement | null; // client microphone played on the host
+  pendingIce: RTCIceCandidateInit[];  // client candidates received before its answer
   // Adaptive-quality control state (AIMD on an absolute per-session bitrate cap).
   adaptCapMbps: number;   // effective ceiling this loop owns; starts = shared share
   lossEwma: number;       // smoothed receiver-reported fractionLost
@@ -558,12 +559,23 @@ class HostEngine {
           return await this.serializeCapture(() => this.startScreen(sessionId, msg));
         case 'rtc-answer': {
           const s = this.sessions.get(sessionId);
-          if (s) await s.pc.setRemoteDescription({ type: 'answer', sdp: msg.sdp });
+          if (s) {
+            await s.pc.setRemoteDescription({ type: 'answer', sdp: msg.sdp });
+            // Trickle ICE can beat the answer over two renderer/main-process
+            // hops. Keep those candidates instead of dropping them with
+            // InvalidStateError while remoteDescription is still null.
+            for (const candidate of s.pendingIce.splice(0)) {
+              try { await s.pc.addIceCandidate(candidate); } catch { /* stale candidate */ }
+            }
+          }
           break;
         }
         case 'rtc-ice': {
           const s = this.sessions.get(sessionId);
-          if (s && msg.candidate) await s.pc.addIceCandidate(msg.candidate);
+          if (s && msg.candidate) {
+            if (s.pc.remoteDescription) await s.pc.addIceCandidate(msg.candidate);
+            else s.pendingIce.push(msg.candidate);
+          }
           break;
         }
         case 'stop-screen': return this.stopScreen(sessionId);
@@ -667,20 +679,6 @@ class HostEngine {
       return;
     }
 
-    // System audio: captured from a virtual audio device (BlackHole & co) via
-    // plain getUserMedia. Note: SCK loopback (getDisplayMedia audio) stalls
-    // ALL screen capture on recent macOS + Electron, so it is not used.
-    let audioTrack: MediaStreamTrack | null = null;
-    let audioCapture: MediaStream | null = null;
-    if (wantAudio && hostSettings.audioEnabled !== false) {
-      let deviceId: string | null = audioSource;
-      if (useLoopback) deviceId = await findVirtualAudioDevice();
-      if (deviceId && deviceId !== 'auto') {
-        audioCapture = await this.captureSystemAudio(deviceId);
-        audioTrack = audioCapture?.getAudioTracks()[0] ?? null;
-      }
-    }
-
     const track = stream.getVideoTracks()[0];
     // 'detail' preserves text sharpness at high bitrate; 'smooth' favors
     // fluid motion (gaming/video) — switchable live from the client menu.
@@ -692,7 +690,7 @@ class HostEngine {
     const session: HostSession = {
       pc, stream, channel: null, fastChannel: null, displayId, sender: null, track,
       captureHeight, scaleFactor, reqBitrate: Number(msg.bitrate) || 150,
-      audioStream: audioCapture, micPlayer: null,
+      audioStream: null, micPlayer: null, pendingIce: [],
       adaptCapMbps: Number(msg.bitrate) || 150,
       lossEwma: 0, rttEwma: 0, rttBaseMs: 1e9,
       stableTicks: 0, holdTicks: 0, coolTicks: 0, qlBwTicks: 0,
@@ -746,12 +744,15 @@ class HostEngine {
 
     // Audio passthrough rides on the first screen's connection only:
     // host system audio -> client, client microphone -> host.
+    let audioTransceiver: RTCRtpTransceiver | null = null;
     if (wantAudio) {
-      // sendrecv even without a host track so the client can still send mic.
-      const audioTransceiver = pc.addTransceiver(audioTrack ?? 'audio', {
+      // Negotiate an audio lane immediately, without waiting for BlackHole (or
+      // another device) to open. The track is attached asynchronously after the
+      // video offer is already on its way, so screen 1 can never be held hostage
+      // by a wedged audio device.
+      audioTransceiver = pc.addTransceiver('audio', {
         direction: 'sendrecv',
       });
-      void audioTransceiver;
 
       pc.ontrack = (e) => {
         if (e.track.kind !== 'audio') return;
@@ -795,6 +796,10 @@ class HostEngine {
     const tunedSdp = tuneVideoSdp(offer.sdp || '', mbps, this.sessions.size);
     await pc.setLocalDescription({ type: 'offer', sdp: tunedSdp });
     warp.toSession(sessionId, { type: 'rtc-offer', sdp: tunedSdp });
+
+    if (audioTransceiver && hostSettings.audioEnabled !== false) {
+      void this.attachSystemAudio(sessionId, audioTransceiver, audioSource, useLoopback);
+    }
 
     // Apply bitrate/framerate caps once connected. maxBitrate is the SHARED
     // per-screen slice (ceiling ÷ live screens), so the streams never fight for
@@ -935,23 +940,72 @@ class HostEngine {
     } catch (err) { console.warn('applyConfig failed', err); }
   }
 
-  // System audio from a dedicated input device (e.g. a BlackHole virtual
-  // device). The 'auto' loopback path is handled inside startScreen, where
-  // audio is captured together with the video in a single stream.
-  private async captureSystemAudio(deviceId: string): Promise<MediaStream | null> {
+  // Attach host audio after the video offer has been sent. The audio m-line was
+  // already negotiated as sendrecv, so replaceTrack does not need a second SDP
+  // exchange and a slow device can no longer stall screen 1.
+  private async attachSystemAudio(
+    sessionId: string,
+    transceiver: RTCRtpTransceiver,
+    audioSource: string,
+    useLoopback: boolean,
+  ) {
+    let deviceId: string | null = audioSource;
+    if (useLoopback) deviceId = await findVirtualAudioDevice();
+    if (!deviceId || deviceId === 'auto') return;
+
+    const capture = await this.captureSystemAudio(deviceId);
+    if (!capture) return;
+    const session = this.sessions.get(sessionId);
+    const track = capture.getAudioTracks()[0];
+    if (!session || !track || session.pc.signalingState === 'closed') {
+      capture.getTracks().forEach((t) => t.stop());
+      return;
+    }
     try {
-      return await navigator.mediaDevices.getUserMedia({
-        audio: {
-          deviceId: { exact: deviceId },
-          echoCancellation: false,
-          noiseSuppression: false,
-          autoGainControl: false,
-          channelCount: 2,
-        },
-      });
+      await transceiver.sender.replaceTrack(track);
+      session.audioStream?.getTracks().forEach((t) => t.stop());
+      session.audioStream = capture;
+    } catch (err) {
+      capture.getTracks().forEach((t) => t.stop());
+      console.warn('system audio attach failed:', err);
+    }
+  }
+
+  // System audio from a dedicated input device (e.g. BlackHole). Bound device
+  // opening because CoreAudio can leave getUserMedia pending indefinitely when
+  // a virtual device is reconfiguring or busy.
+  private async captureSystemAudio(deviceId: string): Promise<MediaStream | null> {
+    let timedOut = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const request = navigator.mediaDevices.getUserMedia({
+      audio: {
+        deviceId: { exact: deviceId },
+        echoCancellation: false,
+        noiseSuppression: false,
+        autoGainControl: false,
+        channelCount: 2,
+      },
+    });
+    // If CoreAudio eventually completes after our deadline, immediately release
+    // that orphaned stream instead of leaking a capture device.
+    request.then((late) => {
+      if (timedOut) late.getTracks().forEach((t) => t.stop());
+    }, () => { /* handled below */ });
+    try {
+      return await Promise.race([
+        request,
+        new Promise<MediaStream>((_, reject) => {
+          timer = setTimeout(() => {
+            timedOut = true;
+            reject(new Error('audio capture timed out'));
+          }, 3000);
+        }),
+      ]);
     } catch (err) {
       console.warn('system audio capture unavailable:', err);
       return null;
+    } finally {
+      clearTimeout(timer);
     }
   }
 
@@ -1120,6 +1174,7 @@ function preferCodec(transceiver: RTCRtpTransceiver, codec: string) {
 }
 
 const hostEngine = new HostEngine();
+warp.hostEngineReady();
 
 // ---------------------------------------------------------------------------
 // Computers page (client side)

@@ -59,6 +59,7 @@ let pc: RTCPeerConnection | null = null;
 let channel: RTCDataChannel | null = null;       // reliable: keys, clicks, clipboard
 let fastChannel: RTCDataChannel | null = null;   // unreliable: continuous mouse move
 let sessionEnded = false;
+let pendingRemoteIce: RTCIceCandidateInit[] = [];
 
 // reconnecting = keep the last decoded frame visible behind a small pill instead
 // of covering everything with the opaque dark panel, so a brief network hiccup
@@ -82,6 +83,7 @@ function cleanup() {
   try { pc?.close(); } catch { /* ignore */ }
   if (ws) { ws.onclose = null; try { ws.close(); } catch { /* ignore */ } }
   channel = null; fastChannel = null; pc = null; ws = null;
+  pendingRemoteIce = [];
   micStream?.getTracks().forEach((t) => t.stop());
   micStream = null;
 }
@@ -128,7 +130,10 @@ function connect() {
 
       case 'rtc-ice':
         if (msg.sessionId !== P.sessionId) return;
-        try { await pc?.addIceCandidate(msg.candidate); } catch { /* ignore */ }
+        // Host candidates can arrive just before rtc-offer. Buffer them until
+        // setRemoteDescription has installed the matching ICE credentials.
+        if (!pc?.remoteDescription) pendingRemoteIce.push(msg.candidate);
+        else try { await pc.addIceCandidate(msg.candidate); } catch { /* stale candidate */ }
         break;
 
       case 'error':
@@ -224,15 +229,23 @@ async function acceptOffer(sdp: string) {
   };
 
   await pc.setRemoteDescription({ type: 'offer', sdp });
+  for (const candidate of pendingRemoteIce.splice(0)) {
+    try { await pc.addIceCandidate(candidate); } catch { /* stale candidate */ }
+  }
 
-  // Attach the microphone (if enabled) to the audio transceiver before
-  // answering, so mic + system audio negotiate in one round trip.
-  if (WANT_AUDIO) await attachMic();
+  // Keep the first screen's audio lane sendrecv even while the mic is off. That
+  // lets us answer immediately and attach a mic later with replaceTrack, without
+  // renegotiation or making video startup wait on microphone permission/device IO.
+  if (WANT_AUDIO) {
+    const tr = audioTransceiver();
+    if (tr) tr.direction = 'sendrecv';
+  }
 
   const answer = await pc.createAnswer();
   answer.sdp = tuneAnswerVideo(mungeOpus(answer.sdp || ''), P.bitrate);
   await pc.setLocalDescription(answer);
   ws?.send(JSON.stringify({ type: 'rtc-answer', sessionId: P.sessionId, sdp: answer.sdp }));
+  if (WANT_AUDIO) void attachMic();
 }
 
 // Prefer stereo, high-bitrate, FEC-protected Opus for the audio we receive.

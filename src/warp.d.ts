@@ -15,6 +15,7 @@ export interface WarpApi {
   getAppVersion(): Promise<string>;
   installUpdate(): Promise<void>;
   onEngineMessage(fn: (data: { sessionId: string; msg: any }) => void): void;
+  hostEngineReady(): void;
   toSession(sessionId: string, msg: any): void;
   getCaptureSource(displayId: number): Promise<{ id: string; name: string; width: number; height: number; scaleFactor: number } | null>;
   queueCaptureDisplay(displayId: number): void;

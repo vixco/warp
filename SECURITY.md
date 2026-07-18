@@ -47,7 +47,7 @@ WireGuard/Tailscale) rather than forwarding the port to the open internet.
 
 ## Reporting a vulnerability
 
-Please report security issues **privately** to **toshan@tovix.nl** rather than
+Please report security issues **privately** to **info@tovix.nl** rather than
 opening a public issue. Include steps to reproduce and the affected version. We
 aim to acknowledge reports within a few days and will coordinate a fix and
 disclosure with you.

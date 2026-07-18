@@ -5,7 +5,7 @@
   "description": "Low-latency remote desktop streaming — host on macOS, play on Windows. Multi-monitor, virtual displays, Parsec-style.",
   "main": "dist/electron/main.js",
   "license": "LGPL-3.0-or-later",
-  "author": "Tovix <toshan@tovix.nl>",
+  "author": "Tovix <info@tovix.nl>",
   "scripts": {
     "build:native": "bash scripts/build-native.sh",
     "build:ts": "tsc -p tsconfig.main.json && tsc -p tsconfig.renderer.json",

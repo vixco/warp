@@ -24,6 +24,7 @@ contextBridge.exposeInMainWorld('warp', {
   // host engine plumbing
   onEngineMessage: (fn: (data: { sessionId: string; msg: any }) => void) =>
     ipcRenderer.on('engine-message', (_e, data) => fn(data)),
+  hostEngineReady: () => ipcRenderer.send('host-engine-ready'),
   toSession: (sessionId: string, msg: any) =>
     ipcRenderer.send('to-session', { sessionId, msg }),
   getCaptureSource: (displayId: number) =>
