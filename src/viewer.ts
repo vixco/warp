@@ -15,6 +15,9 @@ const P = {
   code: params.get('code') || '',
   clientId: params.get('clientId') || '',
   displayId: Number(params.get('displayId')) || 0,
+  virtualWidth: Number(params.get('virtualWidth')) || 0,
+  virtualHeight: Number(params.get('virtualHeight')) || 0,
+  virtualHz: Number(params.get('virtualHz')) || 60,
   // Clamp to the screen-capture ceiling: the macOS host can't capture above
   // ~60 fps, so showing/keeping a higher number here would misrepresent reality.
   fps: Math.min(Number(params.get('fps')) || 60, MAX_STREAM_FPS),
@@ -60,6 +63,30 @@ let channel: RTCDataChannel | null = null;       // reliable: keys, clicks, clip
 let fastChannel: RTCDataChannel | null = null;   // unreliable: continuous mouse move
 let sessionEnded = false;
 let pendingRemoteIce: RTCIceCandidateInit[] = [];
+let activeDisplayId = P.displayId;
+let recreateReqId = 0;
+
+function startRequestedScreen(sock: WebSocket) {
+  showStatus('Starting stream…');
+  sock.send(JSON.stringify({
+    type: 'start-screen',
+    sessionId: P.sessionId,
+    displayId: activeDisplayId,
+    fps: P.fps,
+    bitrate: P.bitrate,
+    codec: P.codec,
+    mode: P.mode,
+    maxHeight: P.maxHeight,
+    wantAudio: WANT_AUDIO,
+  }));
+}
+
+window.warp.onViewerDisplayRemapped(({ oldDisplayId, newDisplayId }) => {
+  for (const rect of screenMap) {
+    if (Number(rect.d) === Number(oldDisplayId)) rect.d = Number(newDisplayId);
+  }
+  if (activeDisplayId === Number(oldDisplayId)) activeDisplayId = Number(newDisplayId);
+});
 
 // reconnecting = keep the last decoded frame visible behind a small pill instead
 // of covering everything with the opaque dark panel, so a brief network hiccup
@@ -104,18 +131,43 @@ function connect() {
     const msg = JSON.parse(e.data);
     switch (msg.type) {
       case 'welcome':
-        showStatus('Starting stream…');
-        sock.send(JSON.stringify({
-          type: 'start-screen',
-          sessionId: P.sessionId,
-          displayId: P.displayId,
-          fps: P.fps,
-          bitrate: P.bitrate,
-          codec: P.codec,
-          mode: P.mode,
-          maxHeight: P.maxHeight,
-          wantAudio: WANT_AUDIO,
-        }));
+        if (!msg.displays?.some((d: any) => Number(d.id) === activeDisplayId) &&
+            P.virtualWidth > 0 && P.virtualHeight > 0) {
+          // The host restarted: its native helper and all macOS virtual-display
+          // objects disappeared, while this fullscreen viewer stayed alive and
+          // reconnected with the old ID. Recreate the display in place instead
+          // of looping forever on "display not found".
+          showStatus('Restoring display…');
+          recreateReqId = Date.now() + P.screenIndex;
+          sock.send(JSON.stringify({
+            type: 'create-vdisplay',
+            reqId: recreateReqId,
+            width: P.virtualWidth,
+            height: P.virtualHeight,
+            hz: P.virtualHz,
+            hidpi: false,
+          }));
+        } else {
+          startRequestedScreen(sock);
+        }
+        break;
+
+      case 'vdisplay-result':
+        if (!recreateReqId || msg.reqId !== recreateReqId) return;
+        recreateReqId = 0;
+        if (!msg.ok || !Number(msg.displayId)) {
+          showStatus(`Host error: ${msg.error || 'could not restore display'}`, true);
+          return;
+        }
+        {
+          const oldDisplayId = activeDisplayId;
+          activeDisplayId = Number(msg.displayId);
+          for (const rect of screenMap) {
+            if (Number(rect.d) === oldDisplayId) rect.d = activeDisplayId;
+          }
+          window.warp.viewerDisplayRemapped(oldDisplayId, activeDisplayId);
+          startRequestedScreen(sock);
+        }
         break;
 
       case 'auth-failed':
@@ -419,11 +471,11 @@ function hostPosFromScreen(sx: number, sy: number): { d: number; x: number; y: n
 function dragHostPos(e: PointerEvent): { d: number; x: number; y: number } | null {
   const local = normalizedPos(e.clientX, e.clientY, false);
   if (local && local.x >= 0 && local.x <= 1 && local.y >= 0 && local.y <= 1) {
-    return { d: P.displayId, x: local.x, y: local.y };
+    return { d: activeDisplayId, x: local.x, y: local.y };
   }
   const gp = hostPosFromScreen(e.screenX, e.screenY);
   if (gp) return gp;
-  return local ? { d: P.displayId, x: local.x, y: local.y } : null;
+  return local ? { d: activeDisplayId, x: local.x, y: local.y } : null;
 }
 
 let menuOpen = false;
@@ -439,7 +491,7 @@ window.addEventListener('pointermove', (e) => {
     // Free hover: unreliable/unordered — the newest position supersedes any
     // dropped one, so movement never head-of-line-blocks.
     const pos = normalizedPos(e.clientX, e.clientY, true);
-    if (pos) sendFast({ t: 'mm', d: P.displayId, x: pos.x, y: pos.y });
+    if (pos) sendFast({ t: 'mm', d: activeDisplayId, x: pos.x, y: pos.y });
     return;
   }
   // Dragging: reliable + ordered, on the same channel as the button events, so
@@ -465,7 +517,7 @@ window.addEventListener('pointerdown', (e) => {
   // Carry the position inside the button event so it's applied atomically with
   // the press — the click/drag can't land at a stale spot even if a move is
   // still in flight.
-  sendInput(pos ? { t: 'md', b, d: P.displayId, x: pos.x, y: pos.y } : { t: 'md', b });
+  sendInput(pos ? { t: 'md', b, d: activeDisplayId, x: pos.x, y: pos.y } : { t: 'md', b });
 });
 
 window.addEventListener('pointerup', (e) => {

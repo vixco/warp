@@ -49,6 +49,10 @@ contextBridge.exposeInMainWorld('warp', {
   viewerCloseSelf: () => ipcRenderer.send('viewer-close-self'),
   viewerCloseAll: () => ipcRenderer.send('viewer-close-all'),
   viewerToggleFullscreen: () => ipcRenderer.send('viewer-toggle-fullscreen'),
+  viewerDisplayRemapped: (oldDisplayId: number, newDisplayId: number) =>
+    ipcRenderer.send('viewer-display-remapped', { oldDisplayId, newDisplayId }),
+  onViewerDisplayRemapped: (fn: (remap: { oldDisplayId: number; newDisplayId: number }) => void) =>
+    ipcRenderer.on('viewer-display-remapped', (_e, remap) => fn(remap)),
   // apply a stream-setting change to every open viewer + persist it globally
   viewerApplyAll: (cfg: any) => ipcRenderer.send('viewer-apply-all', cfg),
   onApplyCfg: (fn: (cfg: any) => void) =>

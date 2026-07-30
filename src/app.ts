@@ -1696,11 +1696,15 @@ async function startStreamingWithSlots(
   const wanted = slots.filter((w) => w.choice !== 'none');
   if (!wanted.length) { toast('Select at least one screen', true); return; }
 
-  const screens: { displayId: number; targetDisplayId: number; label: string; fps: number }[] = [];
+  const screens: {
+    displayId: number; targetDisplayId: number; label: string; fps: number;
+    virtualWidth?: number; virtualHeight?: number; virtualHz?: number;
+  }[] = [];
   for (const w of wanted) {
     const mon = cm.localMonitors[w.monIndex];
     const fps = Number(w.fps) || Math.round(mon.refreshRate) || 60;
     let displayId: number;
+    let virtualSpec: { virtualWidth: number; virtualHeight: number; virtualHz: number } | undefined;
 
     let choice = w.choice;
     if (choice !== 'new' && choice !== 'none') {
@@ -1717,6 +1721,7 @@ async function startStreamingWithSlots(
       const res = await createVdisplayOverWs(width, height, fps);
       if (!res.ok) throw new Error(res.error || 'Could not create virtual display');
       displayId = res.displayId;
+      virtualSpec = { virtualWidth: width, virtualHeight: height, virtualHz: fps };
     } else {
       displayId = Number(choice);
     }
@@ -1725,6 +1730,7 @@ async function startStreamingWithSlots(
       targetDisplayId: mon.id,
       label: `${cm.name} · screen ${screens.length + 1}`,
       fps,
+      ...virtualSpec,
     });
   }
 

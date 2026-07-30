@@ -700,6 +700,7 @@ function closeAllViewers() {
 function openViewerWindow(opts: {
   sessionId: string; host: string; port: number; code: string; clientId: string;
   displayId: number; screenIndex: number; targetDisplayId?: number;
+  virtualWidth?: number; virtualHeight?: number; virtualHz?: number;
   fps: number; bitrateMbps: number; maxHeight: number; codec: string; mode: string; label: string;
   clientCursor: boolean; screenMap?: string;
 }) {
@@ -731,6 +732,9 @@ function openViewerWindow(opts: {
     clientId: opts.clientId,
     displayId: String(opts.displayId),
     screenIndex: String(opts.screenIndex),
+    virtualWidth: String(opts.virtualWidth || 0),
+    virtualHeight: String(opts.virtualHeight || 0),
+    virtualHz: String(opts.virtualHz || opts.fps || 60),
     fps: String(opts.fps),
     bitrate: String(opts.bitrateMbps),
     maxHeight: String(opts.maxHeight),
@@ -838,7 +842,10 @@ function wireIpc() {
   // Viewer window -> open/close/fullscreen helpers
   ipcMain.handle('open-viewers', (_e, args: {
     host: string; port: number; code: string; clientId: string;
-    screens: { displayId: number; targetDisplayId: number; label: string; fps?: number }[];
+    screens: {
+      displayId: number; targetDisplayId: number; label: string; fps?: number;
+      virtualWidth?: number; virtualHeight?: number; virtualHz?: number;
+    }[];
   }) => {
     // Global map of each local monitor's screen-coordinate rect -> the host
     // display shown on it, in DIP space (matching MouseEvent.screenX/Y). Given
@@ -865,6 +872,9 @@ function wireIpc() {
         displayId: s.displayId,
         screenIndex: i,
         targetDisplayId: s.targetDisplayId,
+        virtualWidth: s.virtualWidth,
+        virtualHeight: s.virtualHeight,
+        virtualHz: s.virtualHz,
         // Per-monitor frame rate chosen in the mapping dialog; falls back to
         // the global default when a screen didn't specify one.
         fps: s.fps || settings.fps,
@@ -880,6 +890,22 @@ function wireIpc() {
       });
     });
     return true;
+  });
+
+  // A viewer that recreates a virtual display after a host restart receives a
+  // new macOS display ID. Share that remap with every sibling viewer so
+  // cross-monitor pointer drags use the new IDs too.
+  ipcMain.on('viewer-display-remapped', (_e, remap: {
+    oldDisplayId: number; newDisplayId: number;
+  }) => {
+    const oldDisplayId = Number(remap?.oldDisplayId);
+    const newDisplayId = Number(remap?.newDisplayId);
+    if (!Number.isFinite(oldDisplayId) || !Number.isFinite(newDisplayId)) return;
+    for (const win of viewerWindows.values()) {
+      if (!win.isDestroyed()) {
+        win.webContents.send('viewer-display-remapped', { oldDisplayId, newDisplayId });
+      }
+    }
   });
 
   // One viewer changed a stream setting in its in-stream menu: persist it as the

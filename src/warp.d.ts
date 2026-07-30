@@ -31,6 +31,10 @@ export interface WarpApi {
   viewerCloseSelf(): void;
   viewerCloseAll(): void;
   viewerToggleFullscreen(): void;
+  viewerDisplayRemapped(oldDisplayId: number, newDisplayId: number): void;
+  onViewerDisplayRemapped(fn: (remap: {
+    oldDisplayId: number; newDisplayId: number;
+  }) => void): void;
   viewerApplyAll(cfg: any): void;
   onApplyCfg(fn: (cfg: any) => void): void;
   openPermissionSettings(which: string): Promise<void>;
