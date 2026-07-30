@@ -45,3 +45,29 @@ export function findCaptureSource<T extends CaptureSourceLike>(
 ): T | undefined {
   return sources.find((source) => displayIdsEqual(source.display_id, displayId));
 }
+
+export async function waitForCaptureTarget<
+  TSource extends CaptureSourceLike,
+  TDisplay extends DisplayLike,
+>(
+  loadSources: () => Promise<TSource[]>,
+  loadDisplays: () => TDisplay[],
+  displayId: string | number,
+  attempts = 12,
+  delayMs = 150,
+  wait: (ms: number) => Promise<void> =
+    (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+): Promise<{ source: TSource; display: TDisplay } | null> {
+  const tries = Math.max(1, attempts);
+  for (let attempt = 0; attempt < tries; attempt++) {
+    const [sources, displays] = await Promise.all([
+      loadSources(),
+      Promise.resolve(loadDisplays()),
+    ]);
+    const source = findCaptureSource(sources, displayId);
+    const display = findDisplayById(displays, displayId);
+    if (source && display) return { source, display };
+    if (attempt + 1 < tries) await wait(delayMs);
+  }
+  return null;
+}

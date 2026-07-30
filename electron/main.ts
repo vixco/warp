@@ -11,7 +11,7 @@ import { NativeHelpers } from './helpers';
 import { Discovery, DiscoveredHost, primaryLanIp, wakeMacAddresses, sendWakeOnLan } from './discovery';
 import { HostServer, DisplayInfo, generatePairingCode, safeEqualCode } from './signaling';
 import { ClamshellMonitor } from './clamshell';
-import { connectedDisplays, findCaptureSource, findDisplayById } from './display-utils';
+import { connectedDisplays, findCaptureSource, waitForCaptureTarget } from './display-utils';
 
 const RENDERER = path.join(__dirname, '..', 'renderer');
 
@@ -167,6 +167,13 @@ function loadSettings(): Settings {
       ...defaults,
       ...JSON.parse(fs.readFileSync(settingsFile(), 'utf8')),
     };
+    // The beta locally-rendered cursor used a separate getDisplayMedia path.
+    // ScreenCaptureKit can still bake the OS cursor into that stream (two
+    // cursors), and repeated captures are less reliable for monitor 3. Always
+    // migrate back to the proven desktop-capture path with its single host
+    // cursor. Keep the field only for backwards-compatible settings parsing.
+    const hadExperimentalCursor = merged.suppressCursor === true;
+    merged.suppressCursor = false;
     // Forward-migrate the quality defaults exactly once. For each rev the user
     // hasn't seen yet, any field still holding that rev's OLD default is lifted
     // to the (already-merged) NEW default; a value the user changed themselves
@@ -187,6 +194,9 @@ function loadSettings(): Settings {
       // Persist the bump so it's applied once, not re-evaluated every launch —
       // and so a later deliberate re-pick of the old value sticks. Safe: we only
       // reach here because a settings file already existed and was read above.
+      try { fs.writeFileSync(settingsFile(), JSON.stringify(merged, null, 2)); } catch { /* ignore */ }
+    }
+    if (hadExperimentalCursor) {
       try { fs.writeFileSync(settingsFile(), JSON.stringify(merged, null, 2)); } catch { /* ignore */ }
     }
     return merged;
@@ -746,15 +756,11 @@ function openViewerWindow(opts: {
 function wireIpc() {
   ipcMain.handle('get-settings', () => settings);
   ipcMain.handle('set-settings', (_e, patch: Partial<Settings>) => {
-    const wasSuppress = settings.suppressCursor;
-    settings = { ...settings, ...patch };
+    settings = { ...settings, ...patch, suppressCursor: false };
     saveSettings();
     applyLoginItemSettings();
     refreshTrayMenu();
-    // Start/stop the cursor helper live when the toggle changes while hosting.
-    if (settings.suppressCursor !== wasSuppress && hostServer?.running) {
-      settings.suppressCursor ? helpers.startCursor() : helpers.stopCursor();
-    }
+    helpers.stopCursor();
     return settings;
   });
 
@@ -797,14 +803,19 @@ function wireIpc() {
 
   // Host engine: resolve a capture source id for a given display id
   ipcMain.handle('get-capture-source', async (_e, displayId: number) => {
-    const sources = await desktopCapturer.getSources({
-      types: ['screen'],
-      thumbnailSize: { width: 0, height: 0 },
-    });
-    const src = findCaptureSource(sources, displayId);
-    if (!src) return null;
-    const disp = findDisplayById(getConnectedDisplays(), displayId);
-    if (!disp) return null;
+    // Virtual displays are returned by the native helper slightly before
+    // Electron/ScreenCaptureKit publishes their capture source. Retry for a
+    // bounded ~1.8 s instead of failing the newest (usually third) screen.
+    const target = await waitForCaptureTarget(
+      () => desktopCapturer.getSources({
+        types: ['screen'],
+        thumbnailSize: { width: 0, height: 0 },
+      }),
+      getConnectedDisplays,
+      displayId,
+    );
+    if (!target) return null;
+    const { source: src, display: disp } = target;
     return {
       id: src.id,
       name: src.name,

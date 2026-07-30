@@ -7,6 +7,7 @@ const {
   findCaptureSource,
   findDisplayById,
   normalizedDisplayId,
+  waitForCaptureTarget,
 } = require('../dist/electron/display-utils.js');
 const { parseClamshellState } = require('../dist/electron/clamshell.js');
 
@@ -42,4 +43,37 @@ test('ioreg clamshell state parser handles open, closed and unavailable output',
   assert.equal(parseClamshellState('"AppleClamshellState" = Yes'), true);
   assert.equal(parseClamshellState('"AppleClamshellState" = No'), false);
   assert.equal(parseClamshellState(''), null);
+});
+
+test('fresh third display waits until both Electron display and capture source exist', async () => {
+  let attempt = 0;
+  const waits = [];
+  const result = await waitForCaptureTarget(
+    async () => {
+      attempt++;
+      return attempt < 3 ? [{ display_id: '1' }] : [{ display_id: '1' }, { display_id: '3' }];
+    },
+    () => attempt < 2 ? [{ id: 1 }] : [{ id: 1 }, { id: 3 }],
+    3,
+    3,
+    150,
+    async (ms) => { waits.push(ms); },
+  );
+  assert.deepEqual(result, { source: { display_id: '3' }, display: { id: 3 } });
+  assert.equal(attempt, 3);
+  assert.deepEqual(waits, [150, 150]);
+});
+
+test('capture target retry remains bounded when a display never appears', async () => {
+  let attempts = 0;
+  const result = await waitForCaptureTarget(
+    async () => { attempts++; return [{ display_id: '1' }]; },
+    () => [{ id: 1 }],
+    99,
+    4,
+    1,
+    async () => {},
+  );
+  assert.equal(result, null);
+  assert.equal(attempts, 4);
 });

@@ -56,7 +56,6 @@ async function loadSettingsUi() {
   ($('#setPort') as HTMLInputElement).value = String(settings.port);
   ($('#setPairingCode') as HTMLInputElement).value = settings.pairingCode;
   ($('#setHidpi') as HTMLInputElement).checked = !!settings.hidpiVirtual;
-  ($('#setSuppressCursor') as HTMLInputElement).checked = !!settings.suppressCursor;
   ($('#setLaunchAtLogin') as HTMLInputElement).checked = !!settings.launchAtLogin;
   ($('#setAudioEnabled') as HTMLInputElement).checked = settings.audioEnabled !== false;
   await populateHostAudioDevices();
@@ -97,7 +96,6 @@ $('#saveSettingsBtn').addEventListener('click', async () => {
     port: Number(($('#setPort') as HTMLInputElement).value) || 9750,
     pairingCode: ($('#setPairingCode') as HTMLInputElement).value.replace(/\D/g, ''),
     hidpiVirtual: ($('#setHidpi') as HTMLInputElement).checked,
-    suppressCursor: ($('#setSuppressCursor') as HTMLInputElement).checked,
     launchAtLogin: ($('#setLaunchAtLogin') as HTMLInputElement).checked,
     audioEnabled: ($('#setAudioEnabled') as HTMLInputElement).checked,
     audioSource: ($('#setAudioSource') as HTMLSelectElement).value,
