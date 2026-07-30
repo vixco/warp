@@ -24,6 +24,9 @@ export interface DisplayInfo {
   scaleFactor: number;
   refreshRate?: number;  // native panel refresh rate in Hz
   primary: boolean;
+  internal: boolean;
+  x: number;
+  y: number;
   virtual: boolean;
   vdisplayToken?: number;
 }

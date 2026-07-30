@@ -40,12 +40,13 @@ contextBridge.exposeInMainWorld('warp', {
   getDiscoveredHosts: () => ipcRenderer.invoke('get-discovered-hosts'),
   onDiscoveredHosts: (fn: (hosts: any[]) => void) =>
     ipcRenderer.on('discovered-hosts', (_e, hosts) => fn(hosts)),
-  wakeHost: (mac: string) => ipcRenderer.invoke('wake-host', mac),
+  wakeHost: (macs: string[]) => ipcRenderer.invoke('wake-host', macs),
   getLocalDisplays: () => ipcRenderer.invoke('get-local-displays'),
   openViewers: (args: any) => ipcRenderer.invoke('open-viewers', args),
 
   // viewer window controls
   viewerClose: () => ipcRenderer.send('viewer-close'),
+  viewerCloseSelf: () => ipcRenderer.send('viewer-close-self'),
   viewerCloseAll: () => ipcRenderer.send('viewer-close-all'),
   viewerToggleFullscreen: () => ipcRenderer.send('viewer-toggle-fullscreen'),
   // apply a stream-setting change to every open viewer + persist it globally

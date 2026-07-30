@@ -1,6 +1,14 @@
 /// <reference path="./warp.d.ts" />
 // Main window renderer: UI + host streaming engine + client connect flow.
 
+import {
+  localMonitorRef,
+  resolveSavedMapping,
+  type RemoteDisplayRef,
+  type SavedMapping,
+  type SavedSlot,
+} from './mapping.js';
+
 const $ = <T extends HTMLElement = HTMLElement>(sel: string) =>
   document.querySelector(sel) as T;
 
@@ -557,6 +565,19 @@ class HostEngine {
       switch (msg.type) {
         case 'start-screen':
           return await this.serializeCapture(() => this.startScreen(sessionId, msg));
+        case 'host-displays-changed': {
+          const live = new Set((Array.isArray(msg.displayIds) ? msg.displayIds : [])
+            .map((id: unknown) => Number(id) >>> 0));
+          for (const [id, session] of [...this.sessions]) {
+            if (live.has(session.displayId >>> 0)) continue;
+            warp.toSession(id, {
+              type: 'display-unavailable',
+              error: 'display disconnected',
+            });
+            this.stopScreen(id);
+          }
+          break;
+        }
         case 'rtc-answer': {
           const s = this.sessions.get(sessionId);
           if (s) {
@@ -582,6 +603,13 @@ class HostEngine {
       }
     } catch (err) {
       console.error('host engine error', err);
+      if (sessionId) {
+        this.stopScreen(sessionId);
+        warp.toSession(sessionId, {
+          type: 'error',
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
     }
   }
 
@@ -658,12 +686,27 @@ class HostEngine {
         }) as Promise<MediaStream>;
       }
       // Never let a wedged capture hold the shared lock forever — bound it so a
-      // failed screen surfaces an error and lets the next screen proceed.
-      stream = await Promise.race([
-        capture,
-        new Promise<MediaStream>((_, rej) =>
-          setTimeout(() => rej(new Error('capture timed out')), 12000)),
-      ]);
+      // failed screen surfaces an error and lets the next screen proceed. If the
+      // OS call resolves after our deadline, release that orphaned stream instead
+      // of leaving an invisible capture alive and starving subsequent monitors.
+      let timedOut = false;
+      let timeout: ReturnType<typeof setTimeout> | undefined;
+      capture.then((late) => {
+        if (timedOut) late.getTracks().forEach((track) => track.stop());
+      }, () => { /* handled by the race */ });
+      try {
+        stream = await Promise.race([
+          capture,
+          new Promise<MediaStream>((_, reject) => {
+            timeout = setTimeout(() => {
+              timedOut = true;
+              reject(new Error('capture timed out'));
+            }, 12000);
+          }),
+        ]);
+      } finally {
+        clearTimeout(timeout);
+      }
       // getDisplayMedia may report logical rather than physical pixels — trust
       // the track's real height so scaleResolutionDownBy / cursor sizing stay right.
       if (suppressCursor) {
@@ -1179,8 +1222,13 @@ warp.hostEngineReady();
 // ---------------------------------------------------------------------------
 // Computers page (client side)
 
-interface HostEntry { hostId: string; name: string; ip: string; port: number; platform: string; displays: number; mac?: string }
-interface KnownHost { name: string; mac: string; platform: string; ip: string; port: number }
+interface HostEntry {
+  hostId: string; name: string; ip: string; port: number; platform: string;
+  displays: number; mac?: string; macs?: string[];
+}
+interface KnownHost {
+  name: string; mac: string; macs?: string[]; platform: string; ip: string; port: number;
+}
 
 // Remember every host we've seen (with its MAC) so we can still show it — and
 // Wake-on-LAN it — after it goes to sleep and stops announcing.
@@ -1190,7 +1238,17 @@ function loadKnownHosts(): Record<string, KnownHost> {
 function rememberHosts(live: HostEntry[]) {
   const known = loadKnownHosts();
   for (const h of live) {
-    if (h.mac) known[h.hostId] = { name: h.name, mac: h.mac, platform: h.platform, ip: h.ip, port: h.port };
+    const macs = Array.isArray(h.macs) && h.macs.length ? h.macs : (h.mac ? [h.mac] : []);
+    if (macs.length) {
+      known[h.hostId] = {
+        name: h.name,
+        mac: macs[0],
+        macs,
+        platform: h.platform,
+        ip: h.ip,
+        port: h.port,
+      };
+    }
   }
   try { localStorage.setItem('warp:knownHosts', JSON.stringify(known)); } catch { /* ignore */ }
 }
@@ -1248,9 +1306,17 @@ function renderHosts(live: HostEntry[]) {
     wakeBtn.addEventListener('click', async (e) => {
       e.preventDefault(); e.stopPropagation();
       wakeBtn.disabled = true; wakeBtn.textContent = 'Waking…';
-      const ok = await warp.wakeHost(k.mac);
-      toast(ok ? `Wake signal sent to ${k.name}` : 'Could not send wake signal', !ok);
-      setTimeout(() => { wakeBtn.disabled = false; wakeBtn.textContent = 'Wake'; }, 4000);
+      try {
+        const result = await warp.wakeHost(k.macs?.length ? k.macs : [k.mac]);
+        toast(result.ok
+          ? `Wake signal sent to ${k.name}`
+          : `Could not send wake signal${result.error ? `: ${result.error}` : ''}`,
+        !result.ok);
+      } catch (error) {
+        toast(`Could not send wake signal: ${error instanceof Error ? error.message : String(error)}`, true);
+      } finally {
+        setTimeout(() => { wakeBtn.disabled = false; wakeBtn.textContent = 'Wake'; }, 4000);
+      }
     });
     grid.appendChild(card);
   }
@@ -1271,7 +1337,7 @@ $('#manualConnectBtn').addEventListener('click', () => {
 // ---------------------------------------------------------------------------
 // Connect modal & screen mapping
 
-interface RemoteDisplay { id: number; label: string; width: number; height: number; refreshRate?: number; primary: boolean; virtual: boolean }
+interface RemoteDisplay extends RemoteDisplayRef {}
 
 let cm = {
   host: '', port: 9750, name: '', hostId: '',
@@ -1393,11 +1459,17 @@ async function runConnect(code: string): Promise<void> {
     const saved = loadSavedMapping();
     const isReconnect = !code;
     if (saved && isReconnect && !forceConfigure) {
-      const resolved = resolveSavedSlots(saved);
+      const resolved = resolveSavedMapping(saved, cm.localMonitors, cm.displays);
       const slots = [...resolved.entries()]
         .filter(([, v]) => v.choice !== 'none')
         .map(([monIndex, v]) => ({ monIndex, choice: v.choice, res: v.res, fps: v.fps }));
-      if (slots.length) {
+      // Never silently start a partial monitor set. A dock/monitor-layout change
+      // can leave one old slot matching while all other screens are new; the old
+      // behaviour immediately opened that lone viewer and made it look as if only
+      // screen 1 worked. If every current local monitor matched, a missing host
+      // display is intentional topology change (for example the MacBook lid was
+      // closed) and the remaining connected host screens can still start.
+      if (resolved.size === cm.localMonitors.length && slots.length) {
         $('#cmSub').textContent = 'Starting streams…';
         await startStreamingWithSlots(slots, false);
         return;
@@ -1445,55 +1517,6 @@ function fpsOptionsFor(refreshRate: number): number[] {
 // attributes (label, resolution, position, primary) rather than the volatile
 // numeric ids that macOS/Windows reassign across reboots. That is what lets the
 // arrangement survive "a day later": we re-match by identity, not by id/index.
-interface MonRef { label: string; w: number; h: number; x: number; y: number; primary: boolean }
-interface HostRef {
-  id: number; label: string; width: number; height: number;
-  primary: boolean; virtual: boolean; refreshRate?: number;
-}
-// kind: 'host' = an existing host display (matched by attributes), 'new' = a
-// virtual display we recreate each session, 'none' = this monitor is unused.
-interface SavedSlot {
-  mon: MonRef;
-  kind: 'host' | 'new' | 'none';
-  host?: HostRef;
-  res: string;
-  fps: string;
-}
-interface SavedMapping { version: 2; slots: SavedSlot[] }
-
-function monRefOf(mon: any): MonRef {
-  return {
-    label: String(mon.label || ''),
-    w: mon.width, h: mon.height,
-    x: mon.bounds?.x ?? 0, y: mon.bounds?.y ?? 0,
-    primary: !!mon.primary,
-  };
-}
-
-// How strongly a saved local-monitor ref matches a current monitor. Same size is
-// the anchor; matching label and exact position add confidence so two identical
-// panels are told apart by where they sit.
-function scoreMon(a: MonRef, b: MonRef): number {
-  let s = 0;
-  if (a.label && a.label === b.label) s += 3;
-  if (a.w === b.w && a.h === b.h) s += 3;
-  if (a.x === b.x && a.y === b.y) s += 2;
-  if (a.primary === b.primary) s += 1;
-  return s;
-}
-
-// How strongly a saved host-display ref matches a current host display. Label is
-// the best signal (survives id churn); resolution anchors it; primary/refresh
-// break ties between identical panels.
-function scoreHost(ref: HostRef, d: RemoteDisplay): number {
-  let s = 0;
-  if (ref.label && ref.label === d.label) s += 4;
-  if (ref.width === d.width && ref.height === d.height) s += 3;
-  if (ref.primary === !!d.primary) s += 1;
-  if (ref.refreshRate && d.refreshRate && ref.refreshRate === d.refreshRate) s += 1;
-  return s;
-}
-
 function loadSavedMapping(): SavedMapping | null {
   try {
     const raw = localStorage.getItem(`map:${cm.hostId}`);
@@ -1519,7 +1542,7 @@ function migrateLegacyMapping(old: any): SavedMapping | null {
     const s = old.slots[i];
     const mon = cm.localMonitors[i];
     if (!mon) continue; // fewer monitors now — drop the extra slot
-    const monRef = monRefOf(mon);
+    const monRef = localMonitorRef(mon);
     const res = s.res || 'auto';
     const fps = s.fps || '60';
     if (s.choice === 'none') { slots.push({ mon: monRef, kind: 'none', res, fps }); continue; }
@@ -1529,69 +1552,14 @@ function migrateLegacyMapping(old: any): SavedMapping | null {
     slots.push({
       mon: monRef, kind: 'host', res, fps,
       host: { id: d.id, label: d.label, width: d.width, height: d.height,
-        primary: !!d.primary, virtual: !!d.virtual, refreshRate: d.refreshRate },
+        primary: !!d.primary, virtual: !!d.virtual, internal: d.internal,
+        refreshRate: d.refreshRate, x: d.x, y: d.y },
     });
   }
   if (!slots.length) return null;
   const migrated: SavedMapping = { version: 2, slots };
   try { localStorage.setItem(`map:${cm.hostId}`, JSON.stringify(migrated)); } catch { /* ignore */ }
   return migrated;
-}
-
-// Resolve a saved host reference to a concrete choice value for the current
-// session: a live host display's id, 'new' (recreate a virtual display), or
-// 'none' if the referenced physical display is simply gone. `used` holds the
-// host display ids already claimed by earlier slots, so two saved slots can't
-// both grab the same physical display (which would happen with two identical
-// unlabeled monitors) — the second falls through to the next-best match.
-function resolveHostChoice(slot: SavedSlot, used?: Set<number>): string {
-  if (slot.kind === 'new') return 'new';
-  if (slot.kind === 'none' || !slot.host) return 'none';
-  let best: RemoteDisplay | null = null;
-  let bestScore = 0;
-  for (const d of cm.displays) {
-    if (used?.has(d.id)) continue;
-    const sc = scoreHost(slot.host, d);
-    if (sc > bestScore) { bestScore = sc; best = d; }
-  }
-  if (best && bestScore >= 3) { // size- or label-level match
-    used?.add(best.id);
-    return String(best.id);
-  }
-  // The saved target is absent. A virtual display we made before can just be
-  // recreated; a real monitor that's unplugged is left unused.
-  return slot.host.virtual ? 'new' : 'none';
-}
-
-// Match each current local monitor to at most one saved slot by identity, then
-// translate that slot into { choice, res, fps }. Greedy on the strongest matches
-// first so two identical monitors don't steal each other's slot. Returns a map
-// keyed by the current monitor's index.
-function resolveSavedSlots(saved: SavedMapping): Map<number, { choice: string; res: string; fps: string }> {
-  const out = new Map<number, { choice: string; res: string; fps: string }>();
-  const pairs: { mi: number; si: number; score: number }[] = [];
-  cm.localMonitors.forEach((mon, mi) => {
-    const mref = monRefOf(mon);
-    saved.slots.forEach((slot, si) => {
-      const score = scoreMon(mref, slot.mon);
-      if (score >= 3) pairs.push({ mi, si, score }); // require at least size or label
-    });
-  });
-  pairs.sort((a, b) => b.score - a.score);
-  const usedMon = new Set<number>();
-  const usedSlot = new Set<number>();
-  const usedHostIds = new Set<number>();
-  for (const p of pairs) {
-    if (usedMon.has(p.mi) || usedSlot.has(p.si)) continue;
-    usedMon.add(p.mi); usedSlot.add(p.si);
-    const slot = saved.slots[p.si];
-    out.set(p.mi, {
-      choice: resolveHostChoice(slot, usedHostIds),
-      res: slot.res || 'auto',
-      fps: slot.fps || '60',
-    });
-  }
-  return out;
 }
 
 function renderMapRows() {
@@ -1606,7 +1574,7 @@ function renderMapRows() {
   // Resolve the saved arrangement to THIS session's monitors/displays by
   // identity, so the dialog pre-selects the same choices it will actually
   // restore — even after ids/indices shifted overnight.
-  const resolved = saved ? resolveSavedSlots(saved) : null;
+  const resolved = saved ? resolveSavedMapping(saved, cm.localMonitors, cm.displays) : null;
   rows.innerHTML = '';
 
   cm.localMonitors.forEach((mon, i) => {
@@ -1653,7 +1621,7 @@ function renderMapRows() {
     }
 
     // Restore: in-dialog state > resolved saved mapping > default (all virtual,
-    // auto). The saved values are resolved by identity (resolveSavedSlots), so a
+    // auto). The saved values are resolved by identity (resolveSavedMapping), so a
     // reboot that renumbered displays still lands on the right choice here.
     const rs = resolved?.get(i);
     const wantedChoice = prevChoice[i] ?? rs?.choice ?? 'new';
@@ -1743,13 +1711,14 @@ async function startStreamingWithSlots(
   if (persist) {
     const savedSlots: SavedSlot[] = slots.map((s) => {
       const mon = cm.localMonitors[s.monIndex];
-      const monRef = monRefOf(mon);
+      const monRef = localMonitorRef(mon);
       if (s.choice === 'none') return { mon: monRef, kind: 'none', res: s.res, fps: s.fps };
       if (s.choice === 'new') return { mon: monRef, kind: 'new', res: s.res, fps: s.fps };
       const d = cm.displays.find((dd) => String(dd.id) === s.choice);
-      const host: HostRef = d
+      const host: RemoteDisplayRef = d
         ? { id: d.id, label: d.label, width: d.width, height: d.height,
-            primary: !!d.primary, virtual: !!d.virtual, refreshRate: d.refreshRate }
+            primary: !!d.primary, virtual: !!d.virtual, internal: d.internal,
+            refreshRate: d.refreshRate, x: d.x, y: d.y }
         : { id: Number(s.choice), label: '', width: mon.width, height: mon.height,
             primary: false, virtual: false };
       return { mon: monRef, kind: 'host', host, res: s.res, fps: s.fps };

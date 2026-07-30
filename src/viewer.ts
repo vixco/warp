@@ -139,6 +139,13 @@ function connect() {
       case 'error':
         showStatus(`Host error: ${msg.error}`, true);
         break;
+
+      case 'display-unavailable':
+        if (msg.sessionId !== P.sessionId) return;
+        sessionEnded = true;
+        showStatus('Display disconnected');
+        setTimeout(() => window.warp.viewerCloseSelf(), 750);
+        break;
     }
   };
 

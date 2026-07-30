@@ -9,6 +9,7 @@
   "scripts": {
     "build:native": "bash scripts/build-native.sh",
     "build:ts": "tsc -p tsconfig.main.json && tsc -p tsconfig.renderer.json",
+    "test": "npm run build:ts && tsc -p tsconfig.test.json && node --test tests/*.test.cjs",
     "copy:assets": "node scripts/copy-assets.js",
     "build": "npm run build:ts && npm run copy:assets && npm run build:native",
     "start": "npm run build && electron .",

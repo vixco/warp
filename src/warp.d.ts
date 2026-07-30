@@ -24,10 +24,11 @@ export interface WarpApi {
   requestCursorSnapshot(): void;
   getDiscoveredHosts(): Promise<any[]>;
   onDiscoveredHosts(fn: (hosts: any[]) => void): void;
-  wakeHost(mac: string): Promise<boolean>;
+  wakeHost(macs: string[]): Promise<{ ok: boolean; packets: number; error?: string }>;
   getLocalDisplays(): Promise<any[]>;
   openViewers(args: any): Promise<boolean>;
   viewerClose(): void;
+  viewerCloseSelf(): void;
   viewerCloseAll(): void;
   viewerToggleFullscreen(): void;
   viewerApplyAll(cfg: any): void;

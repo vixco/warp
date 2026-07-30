@@ -8,8 +8,10 @@ import * as os from 'os';
 import * as crypto from 'crypto';
 import { autoUpdater } from 'electron-updater';
 import { NativeHelpers } from './helpers';
-import { Discovery, DiscoveredHost, primaryLanIp, primaryMac, sendWakeOnLan } from './discovery';
+import { Discovery, DiscoveredHost, primaryLanIp, wakeMacAddresses, sendWakeOnLan } from './discovery';
 import { HostServer, DisplayInfo, generatePairingCode, safeEqualCode } from './signaling';
+import { ClamshellMonitor } from './clamshell';
+import { connectedDisplays, findCaptureSource, findDisplayById } from './display-utils';
 
 const RENDERER = path.join(__dirname, '..', 'renderer');
 
@@ -200,6 +202,7 @@ function saveSettings() {
 
 const helpers = new NativeHelpers();
 const discovery = new Discovery();
+const clamshell = new ClamshellMonitor(() => scheduleDisplayTopologyRefresh());
 let mainWindow: BrowserWindow | null = null;
 let hostEngineRendererReady = false;
 const pendingEngineMessages: { sessionId: string; msg: any }[] = [];
@@ -209,6 +212,7 @@ let updateReadyVersion: string | null = null;
 let pendingInstall = false; // set while we're attempting quitAndInstall()
 const RELEASES_URL = 'https://github.com/vixco/warp/releases/latest';
 const viewerWindows = new Map<string, BrowserWindow>(); // sessionId -> window
+const independentViewerCloses = new WeakSet<BrowserWindow>();
 let hostServer: HostServer | null = null;
 let sessionCode = '';
 const vdisplayTokens = new Map<number, number>(); // displayId -> helper token
@@ -236,16 +240,28 @@ function sendToHostEngine(sessionId: string, msg: any) {
 // ---------------------------------------------------------------------------
 // Displays
 
+function getConnectedDisplays() {
+  return connectedDisplays(
+    screen.getAllDisplays(),
+    clamshell.closed,
+    process.platform === 'darwin',
+  );
+}
+
 function getDisplays(): DisplayInfo[] {
-  const primary = screen.getPrimaryDisplay();
-  return screen.getAllDisplays().map((d) => ({
+  const displays = getConnectedDisplays();
+  const primary = displays.find((d) => d.id === screen.getPrimaryDisplay().id) ?? displays[0];
+  return displays.map((d) => ({
     id: d.id,
     label: d.label || `Display ${d.id}`,
     width: Math.round(d.size.width * d.scaleFactor),
     height: Math.round(d.size.height * d.scaleFactor),
     scaleFactor: d.scaleFactor,
     refreshRate: Math.round((d as any).displayFrequency) || 60,
-    primary: d.id === primary.id,
+    primary: d.id === primary?.id,
+    internal: d.internal,
+    x: d.bounds.x,
+    y: d.bounds.y,
     virtual: vdisplayTokens.has(d.id),
     vdisplayToken: vdisplayTokens.get(d.id),
   }));
@@ -335,14 +351,19 @@ async function startHosting(): Promise<{ ok: boolean; error?: string }> {
   hostServer = server;
   helpers.startHosting();
   if (settings.suppressCursor) helpers.startCursor();
-  discovery.startAnnouncing(() => ({
-    hostId: machineId(),
-    name: settings.hostName,
-    port: settings.port,
-    platform: process.platform,
-    displays: screen.getAllDisplays().length,
-    mac: primaryMac(),
-  }));
+  discovery.startAnnouncing(() => {
+    const macs = wakeMacAddresses();
+    return {
+      hostId: machineId(),
+      name: settings.hostName,
+      port: settings.port,
+      platform: process.platform,
+      displays: getDisplays().length,
+      macs,
+      // Kept for clients from before multi-interface wake support.
+      mac: macs[0] || '',
+    };
+  });
   settings.hostingEnabled = true;
   saveSettings();
   pushHostState();
@@ -399,6 +420,21 @@ function pushHostState() {
   }
   hostServer?.broadcastDisplays();
   refreshTrayMenu();
+}
+
+let displayTopologyTimer: ReturnType<typeof setTimeout> | null = null;
+function scheduleDisplayTopologyRefresh() {
+  if (displayTopologyTimer) clearTimeout(displayTopologyTimer);
+  displayTopologyTimer = setTimeout(() => {
+    displayTopologyTimer = null;
+    const displayIds = getDisplays().map((display) => display.id);
+    const live = new Set(displayIds);
+    for (const displayId of vdisplayTokens.keys()) {
+      if (!live.has(displayId)) vdisplayTokens.delete(displayId);
+    }
+    sendToHostEngine('', { type: 'host-displays-changed', displayIds });
+    pushHostState();
+  }, 300);
 }
 
 function permissionStatus() {
@@ -699,6 +735,7 @@ function openViewerWindow(opts: {
   // One screen closing ends the session for all screens (Parsec-style).
   win.on('closed', () => {
     viewerWindows.delete(opts.sessionId);
+    if (independentViewerCloses.delete(win)) return;
     closeAllViewers();
   });
 }
@@ -737,9 +774,10 @@ function wireIpc() {
   ipcMain.handle('stop-hosting', () => stopHosting());
 
   ipcMain.handle('get-discovered-hosts', () => discovery.getHosts());
-  // Wake a sleeping host by broadcasting a Wake-on-LAN magic packet to its MAC
-  // (remembered by the client from a previous discovery).
-  ipcMain.handle('wake-host', (_e, mac: string) => sendWakeOnLan(String(mac || '')));
+  // Resolve only after UDP sends completed, so the UI does not report success
+  // merely because socket creation was scheduled.
+  ipcMain.handle('wake-host', (_e, macs: string[] | string) =>
+    sendWakeOnLan(Array.isArray(macs) ? macs : [String(macs || '')]));
 
   ipcMain.handle('get-local-displays', () =>
     screen.getAllDisplays().map((d, i) => ({
@@ -763,11 +801,10 @@ function wireIpc() {
       types: ['screen'],
       thumbnailSize: { width: 0, height: 0 },
     });
-    const match = sources.find((s) => String(s.display_id) === String(displayId));
-    const src = match ?? sources[0];
+    const src = findCaptureSource(sources, displayId);
     if (!src) return null;
-    const disp = screen.getAllDisplays().find((d) => d.id === displayId)
-      ?? screen.getPrimaryDisplay();
+    const disp = findDisplayById(getConnectedDisplays(), displayId);
+    if (!disp) return null;
     return {
       id: src.id,
       name: src.name,
@@ -857,6 +894,12 @@ function wireIpc() {
 
   ipcMain.on('viewer-close', (e) => {
     BrowserWindow.fromWebContents(e.sender)?.close();
+  });
+  ipcMain.on('viewer-close-self', (e) => {
+    const win = BrowserWindow.fromWebContents(e.sender);
+    if (!win) return;
+    independentViewerCloses.add(win);
+    win.close();
   });
   ipcMain.on('viewer-close-all', () => closeAllViewers());
   ipcMain.on('viewer-toggle-fullscreen', (e) => {
@@ -975,10 +1018,10 @@ app.whenReady().then(async () => {
           types: ['screen'],
           thumbnailSize: { width: 0, height: 0 },
         });
-        let src = sources[0];
-        if (want != null) {
-          src = sources.find((s) => String(s.display_id) === String(want)) || sources[0];
-        }
+        // A video-only request without a queued target is a programming error,
+        // and an unknown target means that display was disconnected. Never fall
+        // back to sources[0]: that made every bad secondary ID capture screen 1.
+        const src = want == null ? undefined : findCaptureSource(sources, want);
         if (!src) { try { callback({} as any); } catch { /* ignore */ } return; }
         callback({ video: src });
       } catch {
@@ -1021,8 +1064,10 @@ app.whenReady().then(async () => {
   applyLoginItemSettings();
   setupAutoUpdater();
 
-  screen.on('display-added', () => pushHostState());
-  screen.on('display-removed', () => pushHostState());
+  screen.on('display-added', scheduleDisplayTopologyRefresh);
+  screen.on('display-removed', scheduleDisplayTopologyRefresh);
+  screen.on('display-metrics-changed', scheduleDisplayTopologyRefresh);
+  clamshell.start();
 
   // Re-arm the keep-awake assertion after the system wakes or switches to AC,
   // and refresh the tray so the power-state line stays accurate. This is what
@@ -1085,5 +1130,6 @@ app.on('before-quit', () => {
   isQuitting = true;
   pendingInstall = false; // quit is really happening — cancel the fallback timer
   stopHosting(false); // keep the hosting preference for next launch
+  clamshell.stop();
   discovery.stop();
 });
