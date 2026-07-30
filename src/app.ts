@@ -678,6 +678,11 @@ class HostEngine {
               minHeight: src.height || 480,
               maxWidth: src.width || 8192,
               maxHeight: src.height || 8192,
+              // Virtual displays do not always emit reliable damage events.
+              // Without a floor Chromium idles a quiet capture down to 1 fps
+              // (or one frame total), so a later desktop update never reaches
+              // the viewer and the first screen appears permanently frozen.
+              minFrameRate: fps,
               maxFrameRate: fps,
             },
           },
@@ -861,35 +866,8 @@ class HostEngine {
         await sender.setParameters(params);
       } catch (err) { console.warn('setParameters failed', err); }
     };
-    // A newly-created virtual display can be completely static. ScreenCaptureKit
-    // then emits one startup frame and goes idle; if that keyframe is produced
-    // before ICE is connected, the viewer can stay black forever because there
-    // is no later frame for WebRTC to encode. Re-attaching the already-live track
-    // once the receiver is connected forces a fresh keyframe without restarting
-    // capture or disturbing the other monitor sessions.
-    let initialFrameRefreshed = false;
-    const refreshInitialFrame = async () => {
-      if (initialFrameRefreshed || track.readyState !== 'live') return;
-      initialFrameRefreshed = true;
-      try {
-        await sender.replaceTrack(null);
-        await new Promise((resolve) => setTimeout(resolve, 80));
-        if (pc.connectionState === 'connected' && track.readyState === 'live') {
-          await sender.replaceTrack(track);
-        }
-      } catch (err) {
-        // Never leave the screen detached if Chromium rejects the refresh.
-        try { if (sender.track !== track) await sender.replaceTrack(track); } catch { /* closed */ }
-        console.warn('initial video refresh failed', err);
-      }
-    };
     pc.addEventListener('connectionstatechange', () => {
-      if (pc.connectionState === 'connected') {
-        void (async () => {
-          await applyParams();
-          await refreshInitialFrame();
-        })();
-      }
+      if (pc.connectionState === 'connected') applyParams();
     });
 
     // A new screen just joined the shared budget: tighten every already-running
@@ -1001,8 +979,15 @@ class HostEngine {
         await s.sender.setParameters(params);
       }
       if (s.track && cfg.fps) {
+        const fps = Math.min(Number(cfg.fps), MAX_CAPTURE_FPS);
+        const current = s.track.getSettings();
         await s.track.applyConstraints({
-          frameRate: { max: Math.min(Number(cfg.fps), MAX_CAPTURE_FPS) },
+          // Keep both the cadence floor and native capture dimensions. Calling
+          // applyConstraints with only a max lets Chromium drop quiet virtual
+          // displays back to 1 fps and may discard the original size constraint.
+          width: current.width ? { ideal: current.width } : undefined,
+          height: current.height ? { ideal: current.height } : undefined,
+          frameRate: { min: fps, max: fps },
         });
       }
     } catch (err) { console.warn('applyConfig failed', err); }
